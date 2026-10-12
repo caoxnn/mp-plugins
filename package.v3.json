@@ -3,13 +3,14 @@
     "name": "硬链接重命名",
     "description": "监控目录文件变化 → 硬链接到目标目录 → 按 MoviePilot 自己的重命名格式给【硬链接】改名（原文件一个字节不动，做种/转种/辅种不受影响）。支持规则表认剧、用播出日期去 TMDB 反查集号。",
     "labels": "工具",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "icon": "Linkace_C.png",
     "author": "nc17",
     "level": 1,
     "release": true,
     "system_version": ">=3.0.0",
     "history": {
+      "v0.2.0": "详情页加「添加规则」：填名字片段 + TMDB编号(:季号) 自动生成规则，剧名自动取，季号可留空按年份算",
       "v0.1.0": "首版：硬链接 + 规则表 + TMDB 识别 + 按 MP 重命名格式改名"
     }
   }

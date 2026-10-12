@@ -174,6 +174,10 @@ class LinkRename(_PluginBase):
     _keep_structure = True
     # 规则表
     _rules = ""
+    # 面板「添加规则」用的三个输入框
+    _rule_name = ""
+    _rule_tmdb = ""
+    _rule_season = ""
     # 源目录 → 目的目录
     _dirconf: Dict[str, Optional[Path]] = {}
     # 退出事件
@@ -198,6 +202,9 @@ class LinkRename(_PluginBase):
             self._rename = config.get("rename", True)
             self._keep_structure = config.get("keep_structure", True)
             self._rules = config.get("rules") or ""
+            self._rule_name = config.get("rule_name") or ""
+            self._rule_tmdb = config.get("rule_tmdb") or ""
+            self._rule_season = config.get("rule_season") or ""
 
         self.stop_service()
 
@@ -283,6 +290,9 @@ class LinkRename(_PluginBase):
             "rename": self._rename,
             "keep_structure": self._keep_structure,
             "rules": self._rules,
+            "rule_name": self._rule_name,
+            "rule_tmdb": self._rule_tmdb,
+            "rule_season": self._rule_season,
         })
 
     @eventmanager.register(EventType.PluginAction)
@@ -366,6 +376,18 @@ class LinkRename(_PluginBase):
                 continue
             pattern, repl = line.split("=>", 1)
             pattern, repl = pattern.strip(), repl.strip()
+            # 傻瓜写法：右边是 TMDB 编号（可带 :季号），左边只要名字里出现就算命中
+            simple = re.fullmatch(r"(\d{1,9})(?::(\d{1,3}))?", repl)
+            if simple:
+                if self.__norm_key(pattern) not in self.__norm_key(name):
+                    continue
+                new_name = self.__simple_rule_name(
+                    int(simple.group(1)),
+                    int(simple.group(2)) if simple.group(2) else None,
+                    name)
+                if new_name:
+                    return new_name
+                continue
             try:
                 if not re.search(pattern, name, flags=re.IGNORECASE):
                     continue
@@ -564,6 +586,18 @@ class LinkRename(_PluginBase):
             "methods": ["GET"],
             "summary": "硬链接重命名",
             "description": "硬链接重命名",
+        }, {
+            "path": "/add_rule",
+            "endpoint": self.add_rule,
+            "methods": ["POST"],
+            "summary": "添加改名规则",
+            "description": "面板上填 名字 + TMDB编号(:季号)，自动生成一条规则",
+        }, {
+            "path": "/del_rule",
+            "endpoint": self.del_rule,
+            "methods": ["POST"],
+            "summary": "删除改名规则",
+            "description": "删除一条规则",
         }]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -589,6 +623,108 @@ class LinkRename(_PluginBase):
             return schemas.Response(success=False, message="请使用 /linkrename 命令")
         self.sync_all()
         return schemas.Response(success=True, message="已开始全量硬链接重命名")
+
+    # ---------------- 面板「添加规则」与傻瓜规则 ----------------
+    @staticmethod
+    def __norm_key(text: str) -> str:
+        """去掉标点空格后小写，用来宽松比对（CCTV1.Voice 和 CCTV1 Voice 视作相同）。"""
+        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (text or "").lower())
+
+    @staticmethod
+    def __tv_details(tmdb_id: int) -> dict:
+        """取 TMDB 剧集详情（剧名 / 首播日期）。"""
+        try:
+            from app.modules.themoviedb.tmdbv3api.objs.tv import TV
+        except Exception as err:  # noqa: BLE001
+            logger.warn(f"TMDB tv 模块不可用：{err}")
+            return {}
+        try:
+            detail = TV().details(tmdb_id)
+        except Exception as err:  # noqa: BLE001
+            logger.warn(f"取剧集信息失败（tmdb={tmdb_id}）：{err}")
+            return {}
+        if hasattr(detail, "as_dict"):
+            detail = detail.as_dict()
+        if not isinstance(detail, dict):
+            detail = getattr(detail, "__dict__", {}) or {}
+        return detail
+
+    @classmethod
+    def __tv_title(cls, tmdb_id: int) -> Optional[str]:
+        """剧名（规则右边没写剧名时用它自动填）。"""
+        return cls.__tv_details(tmdb_id).get("name") or None
+
+    @classmethod
+    def __season_by_year(cls, tmdb_id: int, yyyymmdd: str) -> Optional[int]:
+        """季号不填时：按「播出年份 - 首播年份 + 1」算（开讲啦 2012 首播 → 2026 是第 15 季）。"""
+        first = str(cls.__tv_details(tmdb_id).get("first_air_date") or "")[:4]
+        if not first.isdigit():
+            return None
+        season = int(yyyymmdd[:4]) - int(first) + 1
+        return season if season >= 1 else None
+
+    def __simple_rule_name(self, tmdb_id: int, season: Optional[int], name: str) -> Optional[str]:
+        """傻瓜规则：名字里抓播出日期 → 查集号 → 拼成「剧名 S季E集 + 原后缀」。"""
+        dm = re.search(r"(20\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])", name)
+        if not dm:
+            logger.warn(f"名字里没有 8 位播出日期，傻瓜规则不生效：{name}")
+            return None
+        date_str = dm.group(0)
+        if season is None:
+            season = self.__season_by_year(tmdb_id, date_str)
+            if season is None:
+                logger.warn(f"算不出季号（tmdb={tmdb_id} {date_str}）")
+                return None
+        episode = self.__episode_by_air_date(tmdb_id, season, date_str)
+        if episode is None:
+            logger.warn(f"TMDB 查不到集号（tmdb={tmdb_id} S{season} {date_str}）")
+            return None
+        title = self.__tv_title(tmdb_id)
+        if not title:
+            logger.warn(f"取不到剧名（tmdb={tmdb_id}），傻瓜规则不生效")
+            return None
+        return f"{title} S{season:02d}E{episode:02d}{name[dm.end():]}"
+
+    def add_rule(self, apikey: str = None, **kwargs) -> schemas.Response:
+        """面板「添加规则」：名字 + TMDB编号(:季号) → 自动拼一条规则写进规则表。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False, message="API密钥错误")
+        name = str(kwargs.get("rule_name") or self._rule_name or "").strip()
+        tmdb = str(kwargs.get("rule_tmdb") or self._rule_tmdb or "").strip()
+        season = str(kwargs.get("rule_season") or self._rule_season or "").strip()
+        if not name or not re.fullmatch(r"\d{1,9}", tmdb):
+            return schemas.Response(success=False,
+                                    message="请先填「名字片段」和「TMDB 编号」（TMDB 编号是纯数字）")
+        if season and not re.fullmatch(r"\d{1,3}", season):
+            return schemas.Response(success=False, message="季号只能是数字，或者留空（留空=按年份算）")
+        line = f"{name} => {tmdb}" + (f":{season}" if season else "")
+        lines = [one.strip() for one in (self._rules or "").splitlines() if one.strip()]
+        if line in lines:
+            return schemas.Response(success=True, message=f"这条规则已经在了：{line}")
+        lines.append(line)
+        self._rules = "\n".join(lines)
+        self._rule_name = name
+        self._rule_tmdb = tmdb
+        self._rule_season = season
+        self.__update_config()
+        title = self.__tv_title(int(tmdb)) or name
+        logger.info(f"面板添加规则：{line}（剧名：{title}）")
+        tail = f" 第{season}季" if season else "（季号按年份自动算）"
+        return schemas.Response(success=True, message=f"已添加：{title} → TMDB {tmdb}{tail}")
+
+    def del_rule(self, apikey: str = None, **kwargs) -> schemas.Response:
+        """面板「删除规则」。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False, message="API密钥错误")
+        target = str(kwargs.get("line") or "").strip()
+        lines = [one.strip() for one in (self._rules or "").splitlines() if one.strip()]
+        if target not in lines:
+            return schemas.Response(success=False, message=f"没找到这条规则：{target}")
+        lines.remove(target)
+        self._rules = "\n".join(lines)
+        self.__update_config()
+        logger.info(f"面板删除规则：{target}")
+        return schemas.Response(success=True, message=f"已删除：{target}")
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
@@ -799,10 +935,89 @@ class LinkRename(_PluginBase):
             "monitor_dirs": "",
             "rules": "",
             "exclude_keywords": "",
+            "rule_name": "",
+            "rule_tmdb": "",
+            "rule_season": "",
         }
 
     def get_page(self) -> List[dict]:
-        """详情页：最近改名记录"""
+        """详情页：快速添加规则 + 现有规则 + 最近改名记录"""
+        # 现有傻瓜规则（列出来可删）
+        rule_rows = []
+        for one in (self._rules or "").splitlines():
+            one = one.strip()
+            if not one or one.startswith("#") or "=>" not in one:
+                continue
+            key, _, right = one.partition("=>")
+            if not re.fullmatch(r"\d{1,9}(?::\d{1,3})?", right.strip()):
+                continue
+            rule_rows.append({
+                'component': 'VRow',
+                'props': {'align': 'center'},
+                'content': [
+                    {'component': 'VCol', 'props': {'cols': 7}, 'content': [
+                        {'component': 'VText', 'props': {'text': key.strip()}}]},
+                    {'component': 'VCol', 'props': {'cols': 3}, 'content': [
+                        {'component': 'VChip',
+                         'props': {'color': 'primary', 'size': 'small', 'variant': 'tonal'},
+                         'content': [{'component': 'VText',
+                                      'props': {'text': f'TMDB {right.strip()}'}}]}]},
+                    {'component': 'VCol', 'props': {'cols': 2}, 'content': [
+                        {'component': 'VBtn',
+                         'props': {'size': 'small', 'color': 'error', 'variant': 'tonal'},
+                         'text': '删除',
+                         'events': {'click': {
+                             'api': f"plugin/{self.__class__.__name__}/del_rule?apikey={settings.API_TOKEN}",
+                             'method': 'post',
+                             'params': {'line': one}}}}]},
+                ]
+            })
+
+        add_card = {
+            'component': 'VCard',
+            'props': {'variant': 'tonal', 'class': 'mb-4'},
+            'content': [
+                {'component': 'VCardTitle',
+                 'props': {'class': 'text-subtitle-1'},
+                 'text': '添加规则：左边照抄名字里的一段，右边填 TMDB 编号，剧名它自己取'},
+                {'component': 'VCardText', 'content': [
+                    {'component': 'VRow', 'content': [
+                        {'component': 'VCol', 'props': {'cols': 12, 'md': 5}, 'content': [
+                            {'component': 'VTextField',
+                             'props': {'model': 'rule_name', 'label': '名字片段',
+                                       'placeholder': '例如 CCTV1 Voice',
+                                       'density': 'compact', 'variant': 'outlined'}}]},
+                        {'component': 'VCol', 'props': {'cols': 6, 'md': 3}, 'content': [
+                            {'component': 'VTextField',
+                             'props': {'model': 'rule_tmdb', 'label': 'TMDB 编号',
+                                       'placeholder': '例如 223348',
+                                       'density': 'compact', 'variant': 'outlined'}}]},
+                        {'component': 'VCol', 'props': {'cols': 6, 'md': 2}, 'content': [
+                            {'component': 'VTextField',
+                             'props': {'model': 'rule_season', 'label': '季号（可空）',
+                                       'placeholder': '留空=按年份',
+                                       'density': 'compact', 'variant': 'outlined'}}]},
+                        {'component': 'VCol', 'props': {'cols': 12, 'md': 2}, 'content': [
+                            {'component': 'VBtn',
+                             'props': {'color': 'primary', 'variant': 'flat', 'block': True},
+                             'text': '添加规则',
+                             'events': {'click': {
+                                 'api': f"plugin/{self.__class__.__name__}/add_rule?apikey={settings.API_TOKEN}",
+                                 'method': 'post'}}}]},
+                    ]},
+                    {'component': 'VRow', 'content': [
+                        {'component': 'VCol', 'props': {'cols': 12}, 'content': [
+                            {'component': 'VText',
+                             'props': {'class': 'text-caption text-medium-emphasis',
+                                       'text': '填完点「添加规则」立即生效；季号留空就按「播出年份 − 首播年 + 1」算，跨年不用改。'}}]},
+                    ]},
+                ]},
+                {'component': 'VCardText', 'props': {'class': 'pt-0'}, 'content': rule_rows or [
+                    {'component': 'VText',
+                     'props': {'class': 'text-caption', 'text': '（还没有傻瓜规则）'}}]},
+            ]
+        }
+
         if not self._history:
             return [{
                 'component': 'VAlert',
@@ -827,6 +1042,7 @@ class LinkRename(_PluginBase):
                 ]
             })
         return [
+            add_card,
             {'component': 'VRow', 'content': [
                 {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
                     {'component': 'VText', 'props': {'text': '时间'}}]},
