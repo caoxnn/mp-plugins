@@ -685,13 +685,14 @@ class LinkRename(_PluginBase):
             return None
         return f"{title} S{season:02d}E{episode:02d}{name[dm.end():]}"
 
-    def add_rule(self, apikey: str = None, **kwargs) -> schemas.Response:
+    def add_rule(self, apikey: str = None, rule_name: str = None, rule_tmdb: str = None,
+                 rule_season: str = None) -> schemas.Response:
         """面板「添加规则」：名字 + TMDB编号(:季号) → 自动拼一条规则写进规则表。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False, message="API密钥错误")
-        name = str(kwargs.get("rule_name") or self._rule_name or "").strip()
-        tmdb = str(kwargs.get("rule_tmdb") or self._rule_tmdb or "").strip()
-        season = str(kwargs.get("rule_season") or self._rule_season or "").strip()
+        name = str(rule_name or self._rule_name or "").strip()
+        tmdb = str(rule_tmdb or self._rule_tmdb or "").strip()
+        season = str(rule_season or self._rule_season or "").strip()
         if not name or not re.fullmatch(r"\d{1,9}", tmdb):
             return schemas.Response(success=False,
                                     message="请先填「名字片段」和「TMDB 编号」（TMDB 编号是纯数字）")
@@ -712,11 +713,11 @@ class LinkRename(_PluginBase):
         tail = f" 第{season}季" if season else "（季号按年份自动算）"
         return schemas.Response(success=True, message=f"已添加：{title} → TMDB {tmdb}{tail}")
 
-    def del_rule(self, apikey: str = None, **kwargs) -> schemas.Response:
+    def del_rule(self, apikey: str = None, line: str = None) -> schemas.Response:
         """面板「删除规则」。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False, message="API密钥错误")
-        target = str(kwargs.get("line") or "").strip()
+        target = str(line or "").strip()
         lines = [one.strip() for one in (self._rules or "").splitlines() if one.strip()]
         if target not in lines:
             return schemas.Response(success=False, message=f"没找到这条规则：{target}")
@@ -858,6 +859,47 @@ class LinkRename(_PluginBase):
                                     }
                                 ]
                             }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 5},
+                                'content': [
+                                    {'component': 'VTextField',
+                                     'props': {'model': 'rule_name', 'label': '① 名字片段（照抄）',
+                                               'placeholder': '例如 CCTV1 Voice', 'density': 'compact'}}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 6, 'md': 4},
+                                'content': [
+                                    {'component': 'VTextField',
+                                     'props': {'model': 'rule_tmdb', 'label': '② TMDB 编号',
+                                               'placeholder': '例如 223348', 'density': 'compact'}}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 6, 'md': 3},
+                                'content': [
+                                    {'component': 'VTextField',
+                                     'props': {'model': 'rule_season', 'label': '③ 季号（可空）',
+                                               'placeholder': '留空=按年份算', 'density': 'compact'}}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {'component': 'VText',
+                                     'props': {'class': 'text-caption text-medium-emphasis',
+                                               'text': '填好这三个 → 保存 → 到「详情」页点「添加规则」，自动拼一条规则进下面的规则表（不用手写正则）。'}}
+                                ]
+                            },
                         ]
                     },
                     {
