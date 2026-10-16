@@ -199,7 +199,7 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.3.0"
+    plugin_version = "0.4.0"
     # 插件作者
     plugin_author = "nc17"
     # 作者主页
@@ -412,6 +412,29 @@ class TrackerLimit(_PluginBase):
                 if label and label != cand:
                     out.setdefault(label.lower(), group)
         return out
+
+    def __managed_sites(self, downloader: str) -> Dict[str, Dict[str, Any]]:
+        """这个下载器上「已经有规则」的站：{站名: {keys:[...], upload, peer}}"""
+        out: Dict[str, Dict[str, Any]] = {}
+        for _key, rule in self._rules.items():
+            if str(rule.get("downloader") or "") != downloader:
+                continue
+            name = self.__label(rule.get("tracker"))
+            slot = out.setdefault(name, {"keys": [], "upload": None, "peer": None})
+            tracker = str(rule.get("tracker") or "")
+            if tracker and tracker not in slot["keys"]:
+                slot["keys"].append(tracker)
+            slot["upload"] = _as_int(rule.get("upload_kbps")) or 0
+            slot["peer"] = _as_int(rule.get("peer_limit")) or 0
+        return out
+
+    @staticmethod
+    def __model_suffix(downloader: str, keys: List[str]) -> str:
+        """页面字段后缀：下载器 + 这组域名里排最前的那个（两边算法必须一致）"""
+        if not keys:
+            return ""
+        head = sorted(str(one) for one in keys)[0]
+        return re.sub(r"[^0-9a-zA-Z]+", "_", f"{downloader}_{head}")
 
     def __site_lines(self, downloader: str) -> str:
         """配置页给这个下载器出的规则行：一行一个「站名」（TR 上实际有的站 ∪ 已有规则）。
@@ -840,6 +863,12 @@ class TrackerLimit(_PluginBase):
             "summary": "立即巡检一次",
             "description": "按规则表巡检并应用限速（同一目标批量改一次）",
         }, {
+            "path": "/save_rules",
+            "endpoint": self.api_save_rules,
+            "methods": ["POST"],
+            "summary": "保存规则表",
+            "description": "详情页「保存全部」：up_*/pw_* 字段一次回写（留空=不动、0=不限速/不限制）",
+        }, {
             "path": "/dry_run",
             "endpoint": self.api_dry_run,
             "methods": ["GET", "POST"],
@@ -863,6 +892,67 @@ class TrackerLimit(_PluginBase):
         return []
 
     # -------------------------------------------------------------------- API
+    async def api_save_rules(self, request: Request = None, apikey: str = None) -> schemas.Response:
+        """详情页「保存全部」：把站名后面那两个框的值回写进规则。
+
+        ⚠️ 插件 API 是宿主按函数签名注册的 FastAPI 路由，签名外的参数会被 422，
+        所以这里自己从请求里捞：query（页面字段走这儿）+ JSON body + 表单。
+        字段名 = `up_<下载器>_<主关键字>` / `pw_<下载器>_<主关键字>`（非字母数字换成 _）。
+        留空 = 这一项不动；填 0 = 不限速 / 不限制。同名站（多个域名）一起改。
+        """
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False, message="API密钥错误")
+        got: Dict[str, Any] = {}
+        if request is not None:
+            try:
+                got.update({k: v for k, v in request.query_params.items()})
+            except Exception:  # noqa: BLE001
+                pass
+            for reader in ("json", "form"):
+                try:
+                    one = await getattr(request, reader)()
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(one, dict):
+                    for k, v in one.items():
+                        if not isinstance(v, (dict, list)):
+                            got[k] = v
+        changed: List[str] = []
+        bad: List[str] = []
+        now = datetime.datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
+        for dl in self.__runnable_downloaders() or []:
+            sites = self.__managed_sites(dl)
+            for name in sorted(sites, key=lambda one: (len(str(one)), str(one))):
+                suffix = self.__model_suffix(dl, sites[name]["keys"])
+                if not suffix:
+                    continue
+                for field, key_name in (("up", "upload_kbps"), ("pw", "peer_limit")):
+                    raw = got.get(f"{field}_{suffix}")
+                    if raw is None or str(raw).strip() == "":
+                        continue                      # 留空 = 不动
+                    want = _as_int(raw)
+                    if want is None or want < 0:
+                        bad.append(f"{name} 的{key_name}")
+                        continue
+                    for tracker in sites[name]["keys"]:
+                        rk = self.rule_key(dl, tracker)
+                        rule = self._rules.get(rk) or {"downloader": dl, "tracker": tracker,
+                                                       "enabled": True}
+                        if (_as_int(rule.get(key_name)) or 0) != want:
+                            changed.append(f"{name}｜{dl}｜{key_name} "
+                                           f"{_as_int(rule.get(key_name)) or 0} → {want}")
+                        rule[key_name] = want
+                        rule["updated"] = now
+                        self._rules[rk] = rule
+        if changed:
+            self.__save_rules()
+            self.__sync_config_lines()
+            logger.info(f"站点限速：详情页保存 {len(changed)} 项 - {'；'.join(changed[:10])}")
+        message = f"已保存 {len(changed)} 项改动" if changed else "没有变化（数值和现在一样）"
+        if bad:
+            message += f"；填的不是数字：{'、'.join(bad[:5])}"
+        return schemas.Response(success=True, message=message)
+
     def api_apply_now(self, apikey: str = None) -> schemas.Response:
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False, message="API密钥错误")
@@ -1076,7 +1166,7 @@ class TrackerLimit(_PluginBase):
                     },
                 ]
             }
-            , self.__state_card(), self.__history_card()], {
+            , self.__state_card()], {
             "enabled": False,
             "notify": False,
             "onlyonce": False,
@@ -1088,8 +1178,86 @@ class TrackerLimit(_PluginBase):
 
     # ------------------------------------------------------------------- 详情页
     def get_page(self) -> Optional[List[dict]]:
-        """不再单独做详情页：插件首页就是配置页（状态 + 规则 + 巡检记录都在那儿）"""
-        return None
+        """详情页：一行一个站，站名后面两个框（上传限速 KB/s、peer 上限），改完点「保存全部」"""
+        rows: List[dict] = []
+        for dl in self.__runnable_downloaders() or []:
+            sites = self.__managed_sites(dl)
+            if not sites:
+                continue
+            rows.append({
+                "component": "VRow",
+                "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
+                        {"component": "VText", "props": {"class": "text-subtitle-2",
+                                                         "text": f"下载器 {dl}（{len(sites)} 个站）"}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
+                        {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
+                                                         "text": "上传限速 KB/s"}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
+                        {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
+                                                         "text": "peer 上限"}}]},
+                ]
+            })
+            for name in sorted(sites, key=lambda one: (len(str(one)), str(one))):
+                info = sites[name]
+                suffix = self.__model_suffix(dl, info["keys"])
+                if not suffix:
+                    continue
+                upload = _as_int(info.get("upload")) or 0
+                peer = _as_int(info.get("peer")) or 0
+                # 当前值灌进插件数据 —— 前端的输入框拿它当默认值
+                self.save_data(f"up_{suffix}", upload)
+                self.save_data(f"pw_{suffix}", peer)
+                rows.append({
+                    "component": "VRow",
+                    "props": {"align": "center"},
+                    "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
+                            {"component": "VText", "props": {"class": "text-body-2 font-weight-medium",
+                                                             "text": name}},
+                            {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
+                                                             "text": "、".join(info["keys"])[:60]}}]},
+                        {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
+                            {"component": "VTextField",
+                             "props": {"model": f"up_{suffix}", "value": upload, "type": "number",
+                                       "placeholder": "0 = 不限速", "suffix": "KB/s",
+                                       "density": "compact", "variant": "outlined", "hide-details": True}}]},
+                        {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
+                            {"component": "VTextField",
+                             "props": {"model": f"pw_{suffix}", "value": peer, "type": "number",
+                                       "placeholder": "0 = 不限制",
+                                       "density": "compact", "variant": "outlined", "hide-details": True}}]},
+                    ]
+                })
+
+        page: List[dict] = [{
+            "component": "VCard",
+            "props": {"variant": "tonal", "class": "mb-4"},
+            "content": [
+                {"component": "VCardTitle", "content": [
+                    {"component": "VRow", "props": {"align": "center"}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
+                            {"component": "VText", "props": {"class": "text-subtitle-1",
+                                                             "text": "规则表"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VBtn",
+                             "props": {"color": "primary", "variant": "flat", "block": True, "size": "small"},
+                             "text": "保存全部",
+                             "events": {"click": {
+                                 "api": f"plugin/{self.__class__.__name__}/save_rules"
+                                        f"?apikey={settings.API_TOKEN}",
+                                 "method": "post"}}}]},
+                    ]}]},
+                {"component": "VCardText", "props": {"class": "py-0"}, "content": [
+                    {"component": "VText", "props": {
+                        "class": "text-caption text-medium-emphasis",
+                        "text": "改完点「保存全部」即生效（下一轮巡检 / 点「立即巡检」时按新值改种）。"
+                                "限速 0 = 不限速，peer 0 = 不限制；想加新站去配置页的清单里把那一行的 # 去掉。"}}]},
+                {"component": "VCardText", "props": {"class": "pt-1"}, "content": rows or [
+                    {"component": "VText", "props": {"class": "text-caption", "text": "（还没有规则）"}}]},
+            ]
+        }, self.__history_card()]
+        return page
 
     def stop_service(self):
         """退出插件"""
