@@ -19,7 +19,7 @@
     "name": "站点限速",
     "description": "按 tracker 给 Transmission 里的种子上传限速 + peer 上限：每 N 小时巡检一次，读当前值、只在与规则不一致时改一次（同一目标的种批量下发）。下载器用 MP 里已配好的，不需要另存 RPC 账号。",
     "labels": "工具",
-    "version": "0.5.0",
+    "version": "0.5.1",
     "icon": "Transmission_A.png",
     "author": "nc17",
     "level": 1,

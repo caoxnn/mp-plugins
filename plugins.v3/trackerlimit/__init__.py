@@ -199,7 +199,7 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.5.0"
+    plugin_version = "0.5.1"
     # 插件作者
     plugin_author = "nc17"
     # 作者主页
@@ -410,7 +410,6 @@ class TrackerLimit(_PluginBase):
         """配置项用的后缀：只留字母数字"""
         return re.sub(r"[^0-9a-zA-Z]+", "_", str(value or ""))
 
-    @classmethod
     def __mirror_box_values(self) -> None:
         """把每个站当前的限速 / peer 镜像进插件数据与配置 —— 详情页的输入框靠它显示当时值。
 
