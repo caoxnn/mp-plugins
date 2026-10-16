@@ -1,38 +1,46 @@
 {
-  "LinkRename": {
-    "name": "硬链接重命名",
-    "description": "监控目录文件变化 → 硬链接到目标目录 → 按 MoviePilot 自己的重命名格式给【硬链接】改名（原文件一个字节不动，做种/转种/辅种不受影响）。支持规则表认剧、用播出日期去 TMDB 反查集号。",
-    "labels": "工具",
-    "version": "0.2.1",
-    "icon": "Linkace_C.png",
-    "author": "nc17",
-    "level": 1,
-    "release": true,
-    "system_version": ">=3.0.0",
-    "history": {
-      "v0.2.1": "修面板接口参数（422）；参数输入框同时放进配置页",
-      "v0.2.0": "详情页加「添加规则」：填名字片段 + TMDB编号(:季号) 自动生成规则，剧名自动取，季号可留空按年份算",
-      "v0.1.0": "首版：硬链接 + 规则表 + TMDB 识别 + 按 MP 重命名格式改名"
-    }
-  },
-  "TrackerLimit": {
-    "name": "站点限速",
-    "description": "按 tracker 给 Transmission 里的种子上传限速 + peer 上限：每 N 小时巡检一次，读当前值、只在与规则不一致时改一次（同一目标的种批量下发）。下载器用 MP 里已配好的，不需要另存 RPC 账号。",
-    "labels": "工具",
-    "version": "0.6.2",
-    "icon": "Transmission_A.png",
-    "author": "nc17",
-    "level": 1,
-    "release": true,
-    "system_version": ">=3.0.0",
-    "history": {
-      "v0.4.0": "详情页回来了：一行一个站（站名用 MP 站点索引的名字），后面两个框直接填上传限速 / peer，「保存全部」一次回写；同名站（多个 tracker 域名）一起改。配置页=首页：状态 + 立即巡检/干跑 + 基本配置 + 站点清单（没管的行前面带 #，去掉 # 就开始管）",
-      "v0.3.0": "配置页当首页：状态、立即巡检/干跑、规则、巡检记录都在配置页。规则改成「一行一个站」：站点清单按这两台 TR 上实际有的站自动生成（站名用 MP 站点索引，还没管的站前面带 #），只填数字；同名站一次覆盖它所有 tracker 域名",
-      "v0.2.1": "站点名一律用 MP 内置站点索引（SitesHelper().get_indexsites()，190+ 站）里的 name：馒头/天空/彩虹岛/星陨阁/熊猫高清/藏宝阁/躺平…，MP 没收录的才退回关键字",
-      "v0.2.0": "规则表改成「站点名 + 上传限速 / peer 上限」可编辑：中文站名打头（01.馒头/18.麒麟…），两栏直接填数字，「保存全部」一次回写；删除改成小图标按钮。留空=不动、0=不限速/不限制",
-      "v0.1.2": "匹配口径对齐 go_rpc：内置 86 条「域名→站群别名」表，先精确（别名）再子串兜底 —— 修掉馒头/麒麟/TTG/观众/彩虹岛等别名与域名不同的站会漏的问题（实测命中 3501 → 3983，会被改仍为 0）",
-      "v0.1.1": "修两处实测坑：① transmission_rpc 的 get_torrents(arguments=) 收的是字段名列表，不是 {\"fields\": [...]}（写错就 KeyError: trackers）；② 属性读取统一兜底 + API 出错不再 500",
-      "v0.1.0": "首版：把 go_rpc（Flask + 自带 Transmission RPC）搬成插件 —— 规则表挪到详情页（下载器 · tracker 关键字 · 上传限速 · peer 上限），巡检走 MP 的 DownloaderHelper 拿 Transmission 实例；peer 上限走底层 trc（MP 那层没有这个参数）"
-    }
+ "LinkRename": {
+  "name": "硬链接重命名",
+  "description": "监控目录文件变化 → 硬链接到目标目录 → 按 MoviePilot 自己的重命名格式给【硬链接】改名（原文件一个字节不动，做种/转种/辅种不受影响）。支持规则表认剧、用播出日期去 TMDB 反查集号。",
+  "labels": "工具",
+  "version": "0.2.1",
+  "icon": "Linkace_C.png",
+  "author": "nc17",
+  "level": 1,
+  "release": true,
+  "system_version": ">=3.0.0",
+  "history": {
+   "v0.2.1": "修面板接口参数（422）；参数输入框同时放进配置页",
+   "v0.2.0": "详情页加「添加规则」：填名字片段 + TMDB编号(:季号) 自动生成规则，剧名自动取，季号可留空按年份算",
+   "v0.1.0": "首版：硬链接 + 规则表 + TMDB 识别 + 按 MP 重命名格式改名"
   }
+ },
+ "TrackerLimit": {
+  "name": "站点限速",
+  "description": "按 tracker 给 Transmission 里的种子上传限速 + peer 上限：每 N 小时巡检一次，读当前值、只在与规则不一致时改一次（同一目标的种批量下发）。下载器用 MP 里已配好的，不需要另存 RPC 账号。",
+  "labels": "工具",
+  "version": "0.7.0",
+  "icon": "Transmission_A.png",
+  "author": "nc17",
+  "level": 1,
+  "release": false,
+  "system_version": ">=3.0.0",
+  "history": {
+   "v0.7.0": "按 MP 插件规范整改：只用 app.sdk（SitesHelper 走 app.sdk.network）、日志走 app.sdk.logging；两个接口声明 auth/response_model，业务数据挪进 data；可编辑的两个框从详情页挪到配置页（props.model，宿主自己保存），详情页只做展示；history 与版本对齐；补图标。",
+   "v0.6.2": "历史里的下载器名按整词替换（不再把 transmission 里的 tr 换掉）",
+   "v0.6.1": "只把 Transmission 当可管下载器（qB 不再占分组号）",
+   "v0.6.0": "站点顺序跟 MP 站点配置页一致（SiteOper().list_order_by_pri()，官方插件同款）",
+   "v0.5.1": "修 @classmethod 挂错导致干跑/巡检报 managed_sites missing downloader",
+   "v0.5.0": "配置页去掉规则清单与说明文案；页面不出现下载器真名",
+   "v0.4.2": "修「只看到框没站名」：VText 不是 Vuetify 组件，改 div + 顶层 text",
+   "v0.4.1": "版本号改动补拷进容器",
+   "v0.4.0": "详情页恢复：一行一个站（MP 站名）+ 上传限速 / peer 两个框 + 保存全部",
+   "v0.3.0": "配置页当首页：状态、立即巡检/干跑、规则、巡检记录都在配置页。规则改成「一行一个站」：站点清单按这两台 TR 上实际有的站自动生成（站名用 MP 站点索引，还没管的站前面带 #），只填数字；同名站一次覆盖它所有 tracker 域名",
+   "v0.2.1": "站点名一律用 MP 内置站点索引（SitesHelper().get_indexsites()，190+ 站）里的 name：馒头/天空/彩虹岛/星陨阁/熊猫高清/藏宝阁/躺平…，MP 没收录的才退回关键字",
+   "v0.2.0": "规则表改成「站点名 + 上传限速 / peer 上限」可编辑：中文站名打头（01.馒头/18.麒麟…），两栏直接填数字，「保存全部」一次回写；删除改成小图标按钮。留空=不动、0=不限速/不限制",
+   "v0.1.2": "匹配口径对齐 go_rpc：内置 86 条「域名→站群别名」表，先精确（别名）再子串兜底 —— 修掉馒头/麒麟/TTG/观众/彩虹岛等别名与域名不同的站会漏的问题（实测命中 3501 → 3983，会被改仍为 0）",
+   "v0.1.1": "修两处实测坑：① transmission_rpc 的 get_torrents(arguments=) 收的是字段名列表，不是 {\"fields\": [...]}（写错就 KeyError: trackers）；② 属性读取统一兜底 + API 出错不再 500",
+   "v0.1.0": "首版：把 go_rpc（Flask + 自带 Transmission RPC）搬成插件 —— 规则表挪到详情页（下载器 · tracker 关键字 · 上传限速 · peer 上限），巡检走 MP 的 DownloaderHelper 拿 Transmission 实例；peer 上限走底层 trc（MP 那层没有这个参数）"
+  }
+ }
 }
