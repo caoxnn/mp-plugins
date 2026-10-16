@@ -16,6 +16,7 @@ import datetime
 import threading
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -58,6 +59,99 @@ def _attr(obj: Any, name: str, default: Any = None) -> Any:
     return default if value is None else value
 
 
+SITE_GROUPS: Dict[str, str] = {  # ← 从 go_rpc 的 site_groups 默认表原样搬来（域名 → 站群别名）
+    #   规则表按这个别名匹配：这样 tra1.m-team.cc→mteam、tracker.hdkyl.in→hdkylin、
+    #   tracker.totheglory.im→ttg、tracker.cinefiles.info→audiences、chdbits.xyz/tracker.ptchdbits.co→rainbowisland
+    #   都能命中；不在表里的域名以「域名本身」当别名（所以表里那些 tracker.xxx 的写法照样生效）。
+    "1337x.st": "1337x",
+    "1337x.to": "1337x",
+    "13city.org": "13city",
+    "audiences.me": "audiences",
+    "audiobookbay.fi": "audiobookbay",
+    "audiobookbay.is": "audiobookbay",
+    "audiobookbay.lu": "audiobookbay",
+    "audiobookbay.se": "audiobookbay",
+    "audiobookbay.ws": "audiobookbay",
+    "cf.hdkylin.com": "hdkylin",
+    "chdbits.xyz": "rainbowisland",
+    "duckboobee.org": "march",
+    "e-hentai.org": "ehentai",
+    "exhentai.org": "ehentai",
+    "ext.to": "exttorrents",
+    "extranet.torrentbay.st": "exttorrents",
+    "hddolby.com": "hddolby",
+    "hdkyl.in": "hdkylin",
+    "hdsky.me": "hdsky",
+    "ihdbits.me": "ihdbits",
+    "keepfrds.com": "keepfrds",
+    "longpt.org": "longpt",
+    "marchcms.org": "march",
+    "na.hdkylin.com": "hdkylin",
+    "nexushd.org": "nexushd",
+    "on.springsunday.net": "springsunday",
+    "ourbits.club": "ourbits",
+    "plus.ptdream.net": "ptdream",
+    "pornbits.net": "pornbits",
+    "pornbits.org": "pornbits",
+    "pt.gtk.pw": "ptgtk",
+    "pt.gtkpw.xyz": "ptgtk",
+    "pt.hdupt.com": "hdupt",
+    "pt.keepfrds.com": "keepfrds",
+    "pt.newworld.plus": "ihdbits",
+    "pt.ourhelp.club": "ourbits",
+    "pt.upxin.net": "hdupt",
+    "ptdream.net": "ptdream",
+    "pterclub.net": "pter",
+    "rutracker.net": "rutracker",
+    "rutracker.org": "rutracker",
+    "search.extto.com": "exttorrents",
+    "springsunday.net": "springsunday",
+    "t.audiences.me": "audiences",
+    "theaudiobookbay.se": "audiobookbay",
+    "tleechreload.org": "torrentleech",
+    "tlgetin.cc": "torrentleech",
+    "tokyo-tosho.net": "tokyotosho",
+    "torrentleech.cc": "torrentleech",
+    "torrentleech.me": "torrentleech",
+    "torrentleech.org": "torrentleech",
+    "totheglory.im": "ttg",
+    "tra1.m-team.cc": "mteam",
+    "tracker.cinefiles.info": "audiences",
+    "tracker.hddolby.com": "hddolby",
+    "tracker.hdkyl.in": "hdkylin",
+    "tracker.hdsky.me": "hdsky",
+    "tracker.hhanclub.net": "hhanclub",
+    "tracker.pandapt.net": "pandapt",
+    "tracker.piggo.me": "piggo",
+    "tracker.ptchdbits.co": "rainbowisland",
+    "tracker.pterclub.net": "pter",
+    "tracker.qingwa.pro": "qingwa",
+    "tracker.qingwapt.com": "qingwa",
+    "tracker.qingwapt.org": "qingwa",
+    "tracker.rainbowisland.co": "rainbowisland",
+    "tracker.totheglory.im": "ttg",
+    "v6.nexushd.org": "nexushd",
+    "wiiii.dpdns.org": "longpt",
+    "www.13city.org": "13city",
+    "www.hddolby.com": "hddolby",
+    "www.hdkyl.in": "hdkylin",
+    "www.hdkylin.top": "hdkylin",
+    "www.nexushd.org": "nexushd",
+    "www.ourbits.club": "ourbits",
+    "www.ptdream.net": "ptdream",
+    "www.tleechreload.org": "torrentleech",
+    "www.tlgetin.cc": "torrentleech",
+    "www.tokyotosho.info": "tokyotosho",
+    "www.torrentleech.cc": "torrentleech",
+    "www.torrentleech.me": "torrentleech",
+    "www.torrentleech.org": "torrentleech",
+    "x1337x.cc": "1337x",
+    "x1337x.eu": "1337x",
+    "x1337x.ws": "1337x",
+    "zmpt.cc": "zmpt",
+}
+
+
 class TrackerLimit(_PluginBase):
     # 插件名称
     plugin_name = "站点限速"
@@ -66,7 +160,7 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.1.1"
+    plugin_version = "0.1.2"
     # 插件作者
     plugin_author = "nc17"
     # 作者主页
@@ -172,16 +266,49 @@ class TrackerLimit(_PluginBase):
         return rows
 
     @staticmethod
-    def __match_rule(rules: List[dict], announces: List[str]) -> Optional[dict]:
-        """用 tracker 域名片段去匹配这个种的所有 announce 地址"""
-        haystack = "\n".join(a.lower() for a in announces if a)
-        if not haystack:
+    def __hosts(announces: List[str]) -> List[str]:
+        """把 announce 列表变成小写域名列表"""
+        hosts: List[str] = []
+        for one in announces:
+            try:
+                host = (urlparse(str(one)).hostname or "").lower()
+            except Exception:  # noqa: BLE001
+                host = ""
+            if host:
+                hosts.append(host)
+        return hosts
+
+    @classmethod
+    def __match_rule(cls, rules: List[dict], announces: List[str]) -> Optional[dict]:
+        """先按【站群别名】精确匹配（tra1.m-team.cc → mteam），再退回子串匹配。
+
+        ★ 2026-10-16：原来只做子串匹配，实测比 go_rpc 漏一大截 —— go_rpc 先做
+        `域名 → 站群别名` 映射（site_groups 表）再按别名查规则，所以 tra1.m-team.cc、
+        tracker.hdkyl.in、tracker.totheglory.im、tracker.cinefiles.info、chdbits.xyz
+        这些"别名和域名长得不一样"的站照样命中；朴素子串匹配全都漏（馒头 358、麒麟 690、
+        TTG 195、观众 164、彩虹岛 431 个种）。现在把那张表原样搬进来。
+        """
+        hosts = cls.__hosts(announces)
+        if not hosts:
             return None
+        exact_keys = set(hosts) | {SITE_GROUPS.get(host, host) for host in hosts}
+        # 第一轮：精确（域名 or 站群别名），命中多个时取最长的关键字
+        best: Optional[dict] = None
         for rule in rules:
             key = str(rule.get("tracker") or "").strip().lower()
-            if key and key in haystack:
-                return rule
-        return None
+            if key and key in exact_keys:
+                if best is None or len(key) > len(str(best.get("tracker") or "").strip().lower()):
+                    best = rule
+        if best is not None:
+            return best
+        # 第二轮：子串兜底（表里写 cspt.top 也能命中 tracker.cspt.top）
+        text = "\n".join(hosts)
+        for rule in rules:
+            key = str(rule.get("tracker") or "").strip().lower()
+            if key and key in text:
+                if best is None or len(key) > len(str(best.get("tracker") or "").strip().lower()):
+                    best = rule
+        return best
 
     # ------------------------------------------------------------------ 巡检
     @staticmethod
