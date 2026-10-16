@@ -48,6 +48,16 @@ def _as_int(value: Any) -> Optional[int]:
         return None
 
 
+def _attr(obj: Any, name: str, default: Any = None) -> Any:
+    """安全读属性：transmission_rpc 的 Torrent 属性在字段没请求时会抛 KeyError，
+    getattr 的默认值救不了它 —— 这里统一兜住。"""
+    try:
+        value = getattr(obj, name)
+    except Exception:  # noqa: BLE001
+        return default
+    return default if value is None else value
+
+
 class TrackerLimit(_PluginBase):
     # 插件名称
     plugin_name = "站点限速"
@@ -56,7 +66,7 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.1.0"
+    plugin_version = "0.1.1"
     # 插件作者
     plugin_author = "nc17"
     # 作者主页
@@ -177,13 +187,19 @@ class TrackerLimit(_PluginBase):
     @staticmethod
     def __announces(torrent: Any) -> List[str]:
         out: List[str] = []
-        trackers = getattr(torrent, "trackers", None) or []
+        trackers = _attr(torrent, "trackers", None) or []
         for one in trackers:
-            announce = getattr(one, "announce", None)
+            announce = None
+            if isinstance(one, dict):
+                announce = one.get("announce")
+            else:
+                fields = getattr(one, "fields", None)
+                if isinstance(fields, dict):
+                    announce = fields.get("announce")
+                if not announce:
+                    announce = _attr(one, "announce", None)
             if announce:
                 out.append(str(announce))
-            elif isinstance(one, dict) and one.get("announce"):
-                out.append(str(one["announce"]))
         return out
 
     def scan_and_apply(self, apply: bool = True) -> dict:
@@ -233,10 +249,11 @@ class TrackerLimit(_PluginBase):
                 continue
 
             try:
-                torrents = trc.get_torrents(arguments={"fields": [
-                    "id", "hashString", "name", "uploadLimit", "uploadLimited",
-                    "peer-limit", "trackers",
-                ]})
+                # ⚠️ transmission_rpc 的 arguments 是**字段名列表**（不是 {"fields": [...]}）：
+                #    传错会只请求 ["fields","id","hashString"]，读 trackers/peer-limit 就 KeyError。
+                torrents = trc.get_torrents(arguments=[
+                    "name", "uploadLimit", "uploadLimited", "peer-limit", "trackers",
+                ])
             except Exception as err:  # noqa: BLE001
                 msg = f"{name}：拉种子列表失败 - {err}"
                 logger.error(f"站点限速：{msg}")
@@ -249,7 +266,7 @@ class TrackerLimit(_PluginBase):
             groups: Dict[Tuple[bool, int, Optional[int]], List[str]] = {}
             hash2name: Dict[str, str] = {}
             for torrent in torrents:
-                hash_string = str(getattr(torrent, "hash_string", "") or "")
+                hash_string = str(_attr(torrent, "hash_string", "") or "")
                 if not hash_string:
                     continue
                 rule = self.__match_rule(rules, self.__announces(torrent))
@@ -265,9 +282,9 @@ class TrackerLimit(_PluginBase):
                     target_upload_limited, target_upload = False, 0
                 target_peer = int(want_peer) if want_peer and want_peer > 0 else None
 
-                cur_limited = bool(getattr(torrent, "upload_limited", False))
-                cur_upload = int(getattr(torrent, "upload_limit", 0) or 0)
-                cur_peer = _as_int(getattr(torrent, "peer_limit", None))
+                cur_limited = bool(_attr(torrent, "upload_limited", False))
+                cur_upload = int(_attr(torrent, "upload_limit", 0) or 0)
+                cur_peer = _as_int(_attr(torrent, "peer_limit", None))
 
                 diff = (cur_limited != target_upload_limited)
                 if target_upload_limited and cur_upload != target_upload:
@@ -280,7 +297,7 @@ class TrackerLimit(_PluginBase):
                 groups.setdefault(
                     (target_upload_limited, target_upload, target_peer), []
                 ).append(hash_string)
-                hash2name[hash_string] = str(getattr(torrent, "name", "") or "")
+                hash2name[hash_string] = str(_attr(torrent, "name", "") or "")
 
             for (target_limited, target_upload, target_peer), hashes in groups.items():
                 if not apply:
@@ -421,19 +438,29 @@ class TrackerLimit(_PluginBase):
     def api_apply_now(self, apikey: str = None) -> schemas.Response:
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False, message="API密钥错误")
-        result = self.apply_now() or {}
+        try:
+            result = self.apply_now() or {}
+        except Exception as err:  # noqa: BLE001
+            logger.error(f"站点限速：立即巡检失败 - {err} - {traceback.format_exc()}")
+            return schemas.Response(success=False, message=f"巡检失败：{err}")
         message = f"巡检完成：扫描 {result.get('scanned', 0)}，命中 {result.get('matched', 0)}，改 {result.get('changed', 0)}"
         if result.get("errors"):
-            message += f"；错误：{'；'.join(result['errors'])[:200]}"
+            message += f"；错误：{'；'.join(str(e) for e in result['errors'])[:200]}"
         return schemas.Response(success=True, message=message)
 
     def api_dry_run(self, apikey: str = None) -> schemas.Response:
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False, message="API密钥错误")
-        with lock:
-            result = self.scan_and_apply(apply=False) or {}
+        try:
+            with lock:
+                result = self.scan_and_apply(apply=False) or {}
+        except Exception as err:  # noqa: BLE001
+            logger.error(f"站点限速：干跑失败 - {err} - {traceback.format_exc()}")
+            return schemas.Response(success=False, message=f"干跑失败：{err}")
         message = (f"干跑：扫描 {result.get('scanned', 0)}，命中 {result.get('matched', 0)}，"
                    f"会被改 {result.get('changed', 0)}（没实际改）")
+        if result.get("errors"):
+            message += f"；错误：{'；'.join(str(e) for e in result['errors'])[:200]}"
         return schemas.Response(success=True, message=message)
 
     def api_save_rule(self, apikey: str = None, rule_downloader: str = None,
