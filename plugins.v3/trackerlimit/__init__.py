@@ -199,7 +199,7 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.5.1"
+    plugin_version = "0.6.0"
     # 插件作者
     plugin_author = "nc17"
     # 作者主页
@@ -313,6 +313,34 @@ class TrackerLimit(_PluginBase):
 
     _mp_name_cache: Optional[Dict[str, str]] = None
     _mp_name_at: float = 0.0
+    _pri_cache: Optional[Dict[str, int]] = None
+    _pri_at: float = 0.0
+
+    @classmethod
+    def __site_pri(cls) -> Dict[str, int]:
+        """站点顺序：跟 MP「站点配置」页一致 —— 按 pri，用的就是官方插件那套
+        `SiteOper().list_order_by_pri()`（bangumicoll / agentresourceofficer 都这么取）。10 分钟缓存。
+        """
+        now = time.time()
+        if cls._pri_cache is not None and now - cls._pri_at < 600:
+            return cls._pri_cache
+        table: Dict[str, int] = {}
+        try:
+            from app.db.oper.site import SiteOper  # noqa: PLC0415
+            for idx, site in enumerate(SiteOper().list_order_by_pri() or []):
+                name = str(getattr(site, "name", "") or "").strip()
+                if name and name not in table:
+                    table[name] = idx
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f"站点限速：读取站点优先级失败 - {err}")
+        cls._pri_cache, cls._pri_at = table, now
+        return table
+
+    @classmethod
+    def __sort_names(cls, names: Any) -> List[str]:
+        """站点按 MP 站点配置页的顺序排；MP 里没有的排最后（按名字）。"""
+        pri = cls.__site_pri()
+        return sorted(names, key=lambda one: (pri.get(str(one), 10 ** 6), str(one)))
 
     @classmethod
     def __mp_site_names(cls) -> Dict[str, str]:
@@ -802,7 +830,7 @@ class TrackerLimit(_PluginBase):
         now = datetime.datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
         for dl in self.__runnable_downloaders() or []:
             sites = self.__managed_sites(dl)
-            for name in sorted(sites, key=lambda one: (len(str(one)), str(one))):
+            for name in self.__sort_names(sites):
                 suffix = self.__model_suffix(dl, sites[name]["keys"])
                 if not suffix:
                     continue
@@ -1047,7 +1075,7 @@ class TrackerLimit(_PluginBase):
                         {"component": "VText", "props": {"text": "peer 上限"}}]},
                 ]
             })
-            for name in sorted(sites, key=lambda one: (len(str(one)), str(one))):
+            for name in self.__sort_names(sites):
                 info = sites[name]
                 suffix = self.__model_suffix(dl, info["keys"])
                 if not suffix:
