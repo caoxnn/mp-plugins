@@ -145,11 +145,11 @@ class LinkRename(_PluginBase):
     # 插件图标
     plugin_icon = "Linkace_C.png"
     # 插件版本
-    plugin_version = "0.2.2"
+    plugin_version = "0.2.3"
     # 插件作者
     plugin_author = "caoxnn"
     # 作者主页
-    author_url = "https://github.com/xunanning/mp-plugins"
+    author_url = "https://github.com/caoxnn/mp-plugins"
     # 插件配置项ID前缀
     plugin_config_prefix = "linkrename_"
     # 加载顺序

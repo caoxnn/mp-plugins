@@ -212,11 +212,11 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.7.1"
+    plugin_version = "0.7.2"
     # 插件作者
     plugin_author = "caoxnn"
     # 作者主页
-    author_url = "https://github.com/xunanning/mp-plugins"
+    author_url = "https://github.com/caoxnn/mp-plugins"
     # 插件配置项ID前缀
     plugin_config_prefix = "trackerlimit_"
     # 加载顺序
