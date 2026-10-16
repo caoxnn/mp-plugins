@@ -97,6 +97,17 @@ SITE_GROUPS: Dict[str, str] = {  # ← 从 go_rpc 的 site_groups 默认表原�
     "ext.to": "exttorrents",
     "extranet.torrentbay.st": "exttorrents",
     "hddolby.com": "hddolby",
+    # ★ 2026-10-16 实扫两台 TR 补的：这些域名前面的表里没有，精确和子串两轮都兜不住
+    "agsvpt.cn": "agsvpt",
+    "hdhome.org": "hdhome",
+    "ubits.club": "ubits",
+    "xingyungept.org": "xingyunge",
+    "hdarea.club": "hdarea",
+    "btschool.club": "btschool",
+    "crabpt.vip": "crabpt",
+    "nicept.net": "nicept",
+    "luckpt.de": "luckpt",
+    "tangpt.top": "tangpt",
     "hdkyl.in": "hdkylin",
     "hdsky.me": "hdsky",
     "ihdbits.me": "ihdbits",
@@ -212,11 +223,11 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.7.2"
+    plugin_version = "0.7.3"
     # 插件作者
-    plugin_author = "caoxnn"
+    plugin_author = "nc17"
     # 作者主页
-    author_url = "https://github.com/caoxnn/mp-plugins"
+    author_url = "https://github.com/g15377099016-commits/mp-plugins"
     # 插件配置项ID前缀
     plugin_config_prefix = "trackerlimit_"
     # 加载顺序
@@ -517,7 +528,17 @@ class TrackerLimit(_PluginBase):
             logger.debug(f"站点限速：回写输入框默认值失败 - {err}")
 
     def __managed_sites(self, downloader: str) -> Dict[str, Dict[str, Any]]:
-        """这个下载器上「已经有规则」的站：{站名: {keys:[...], upload, peer}}"""
+        """这个下载器上要管的站：已有规则的 ∪ **实际出现在这台 TR 上的**。
+
+        {站名: {keys:[tracker 关键字…], upload, peer}}
+
+        用户 2026-10-16：「限速插件怎么没有春天站点 逻辑不是看 tr 有哪些 TRACKER 然后就对应站点么」
+        +「一个站可能有好几个 TRACKER 你要注意」——所以：
+        ① 先把两台 TR 上实际出现的 tracker 域名扫出来（`__scan_hosts`，带缓存）；
+        ② 域名 → 站群别名（`SITE_GROUPS`），同一个站有好几个域名的**合成一行**（keys 全带上）；
+        ③ 已经配过规则的站照旧保留（哪怕这台机器上暂时没它的种）。
+        保存时 `__apply_box_config` 会把这行写进它**全部** tracker 关键字，一个不落。
+        """
         out: Dict[str, Dict[str, Any]] = {}
         for _key, rule in self._rules.items():
             if str(rule.get("downloader") or "") != downloader:
@@ -529,7 +550,70 @@ class TrackerLimit(_PluginBase):
                 slot["keys"].append(tracker)
             slot["upload"] = _as_int(rule.get("upload_kbps")) or 0
             slot["peer"] = _as_int(rule.get("peer_limit")) or 0
+        for tracker in self.__scan_keys(downloader):
+            name = self.__label(tracker)
+            slot = out.setdefault(name, {"keys": [], "upload": None, "peer": None})
+            if tracker not in slot["keys"]:
+                slot["keys"].append(tracker)
+            if slot["upload"] is None:
+                slot["upload"] = 0
+            if slot["peer"] is None:
+                slot["peer"] = 0
         return out
+
+    SITES_CACHE_TTL = 600
+
+    def __scan_hosts(self, downloader: str) -> List[str]:
+        """这台下载器上实际出现的 tracker 域名（扫描结果缓存 10 分钟，页面渲染不卡）。"""
+        import time as _time
+        cache = self.get_data("site_scan") or {}
+        entry = cache.get(downloader) or {}
+        try:
+            fresh = (_time.time() - float(entry.get("ts") or 0)) < self.SITES_CACHE_TTL
+        except (TypeError, ValueError):
+            fresh = False
+        if fresh and entry.get("hosts"):
+            return list(entry["hosts"])
+
+        hosts: List[str] = []
+        instance = self.__transmission_instances().get(downloader)
+        if instance is not None:
+            try:
+                trc = getattr(instance, "trc", None) or getattr(instance, "instance", None)
+                if trc is None:
+                    logger.warn(f"站点限速：{downloader} 拿不到底层客户端，站点清单只能靠已配规则")
+                    return hosts
+                torrents = trc.get_torrents(arguments=["trackers"]) or []
+                for torrent in torrents:
+                    for announce in self.__announces(torrent):
+                        host = ""
+                        try:
+                            host = (urlparse(announce).hostname or "").lower()
+                        except Exception:  # noqa: BLE001
+                            host = ""
+                        if host and host not in hosts:
+                            hosts.append(host)
+            except Exception as err:  # noqa: BLE001
+                logger.error(f"站点限速：扫 {downloader} 的 tracker 失败 - {err}")
+        if hosts:
+            cache[downloader] = {"ts": _time.time(), "hosts": hosts}
+            self.save_data("site_scan", cache)
+        elif entry.get("hosts"):
+            hosts = list(entry["hosts"])
+        return hosts
+
+    def __scan_keys(self, downloader: str) -> List[str]:
+        """扫描到的域名 → 规则关键字：能映射到站群别名的就用别名（一个别名覆盖该站所有域名）。
+
+        用户提醒「一个站可能有好几个 TRACKER」——用别名当关键字时，规则按【精确别名】匹配，
+        `on.springsunday.net`、`springsunday.net` 一起命中，不用一个域名一条规则。
+        """
+        keys: List[str] = []
+        for host in self.__scan_hosts(downloader):
+            key = str(SITE_GROUPS.get(host) or host).strip().lower()
+            if key and key not in keys:
+                keys.append(key)
+        return keys
 
     @staticmethod
     def __hosts(announces: List[str]) -> List[str]:
