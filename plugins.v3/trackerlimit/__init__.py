@@ -199,7 +199,7 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.4.1"
+    plugin_version = "0.4.2"
     # 插件作者
     plugin_author = "nc17"
     # 作者主页
@@ -385,6 +385,26 @@ class TrackerLimit(_PluginBase):
             if word in key:
                 return re.sub(r"^\d\d\.", "", SITE_LABELS[word])
         return str(tracker or "")
+
+    @staticmethod
+    def __fix_nodes(node: Any) -> Any:
+        """VText 不是 Vuetify 组件（MP 页面上根本不渲染）→ 换成官方写法：div + 顶层 text。
+
+        官方插件里文本一律是 `{"component": "div", "props": {"class": ...}, "text": "..."}`
+        （文本框类 Vuetify 组件的 props.text 才有效，比如 VAlert/VTextField）。
+        """
+        if isinstance(node, list):
+            return [TrackerLimit.__fix_nodes(one) for one in node]
+        if isinstance(node, dict):
+            out = {key: TrackerLimit.__fix_nodes(value) for key, value in node.items()}
+            if out.get("component") == "VText":
+                props = dict(out.get("props") or {})
+                text = props.pop("text", out.get("text"))
+                out["component"] = "div"
+                out["props"] = props
+                out["text"] = text
+            return out
+        return node
 
     @classmethod
     def __runnable_downloaders(cls) -> List[str]:
@@ -1081,7 +1101,7 @@ class TrackerLimit(_PluginBase):
 
     # ------------------------------------------------------------------- 配置页
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        return [
+        return self.__fix_nodes([
             {
                 "component": "VForm",
                 "content": [
@@ -1166,7 +1186,7 @@ class TrackerLimit(_PluginBase):
                     },
                 ]
             }
-            , self.__state_card()], {
+            , self.__state_card()]), {
             "enabled": False,
             "notify": False,
             "onlyonce": False,
@@ -1252,7 +1272,7 @@ class TrackerLimit(_PluginBase):
                     {"component": "VText", "props": {"class": "text-caption", "text": "（还没有规则）"}}]},
             ]
         }, self.__history_card()]
-        return page
+        return self.__fix_nodes(page)
 
     def stop_service(self):
         """退出插件"""
