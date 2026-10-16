@@ -16,6 +16,7 @@ import datetime
 import threading
 import traceback
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -198,7 +199,7 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.2.0"
+    plugin_version = "0.2.1"
     # 插件作者
     plugin_author = "nc17"
     # 作者主页
@@ -303,13 +304,67 @@ class TrackerLimit(_PluginBase):
         rows.sort(key=lambda x: len(str(x.get("tracker") or ""), ), reverse=True)
         return rows
 
-    @staticmethod
-    def __label(tracker: Any) -> str:
-        """规则关键字 → 给人看的站点名（认不出来就原样显示关键字）"""
+    _mp_name_cache: Optional[Dict[str, str]] = None
+    _mp_name_at: float = 0.0
+
+    @classmethod
+    def __mp_site_names(cls) -> Dict[str, str]:
+        """MP 站点索引里的显示名：{小写 站点id / 域名: 名字}，10 分钟缓存。
+
+        站点名一律按 MP 的规矩来：宿主内置站点索引 `SitesHelper().get_indexsites()`
+        （域名 → {id, name, url}，共 190+ 站，名称就是 MP 界面上显示的那个），
+        不自己起名字；MP 没收录的站才退回关键字本身。
+        """
+        now = time.time()
+        if cls._mp_name_cache is not None and now - cls._mp_name_at < 600:
+            return cls._mp_name_cache
+        table: Dict[str, str] = {}
+        try:
+            from app.application.site.sites import SitesHelper  # noqa: PLC0415
+            catalog = SitesHelper().get_indexsites() or {}
+            if isinstance(catalog, dict):
+                for domain, info in catalog.items():
+                    if not isinstance(info, dict):
+                        continue
+                    name = str(info.get("name") or "").strip()
+                    if not name:
+                        continue
+                    host = str(domain or "").strip().lower()
+                    if host:
+                        table.setdefault(host, name)
+                        for prefix in ("www.", "pt.", "api.", "kp.", "t.", "xp."):
+                            if host.startswith(prefix):
+                                table.setdefault(host[len(prefix):], name)
+                    site_id = str(info.get("id") or "").strip().lower()
+                    if site_id:
+                        table.setdefault(site_id, name)
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f"站点限速：读 MP 站点索引失败（就按关键字显示）- {err}")
+        cls._mp_name_cache, cls._mp_name_at = table, now
+        return table
+
+    @classmethod
+    def __label(cls, tracker: Any) -> str:
+        """规则关键字 → 站点名：先按 MP 站点索引，再按自家中文名表，最后原样显示关键字"""
         key = str(tracker or "").lower()
+        if not key:
+            return str(tracker or "")
+        table = cls.__mp_site_names()
+        if key in table:
+            return table[key]
+        hosts = {host for host, group in SITE_GROUPS.items() if group == key} | {key}
+        for host in hosts:
+            if host in table:
+                return table[host]
+            if "." in host and host.split(".", 1)[1] in table:
+                return table[host.split(".", 1)[1]]
+        for host in hosts:
+            for domain, name in table.items():
+                if "." in domain and host.endswith("." + domain):
+                    return name
         for word in sorted(SITE_LABELS, key=len, reverse=True):
             if word in key:
-                return SITE_LABELS[word]
+                return re.sub(r"^\d\d\.", "", SITE_LABELS[word])
         return str(tracker or "")
 
     @classmethod
@@ -584,6 +639,7 @@ class TrackerLimit(_PluginBase):
             "methods": ["GET", "POST"],
             "summary": "干跑一次",
             "description": "只列出会被改的种，不真改",
+        }, {
         }, {
             "path": "/save_rules",
             "endpoint": self.api_save_rules,
