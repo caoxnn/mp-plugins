@@ -199,7 +199,7 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.6.1"
+    plugin_version = "0.6.2"
     # 插件作者
     plugin_author = "nc17"
     # 作者主页
@@ -930,10 +930,14 @@ class TrackerLimit(_PluginBase):
                          for idx, dl in enumerate(names, start=1)})
 
         def hide(value: Any) -> str:
+            """把下载器真名换成「下载器 N」——只在它是独立词时换，
+            免得把 transmission 这类词里的 tr 也换掉。"""
             text = str(value or "")
             for raw, label in sorted(label_of.items(), key=lambda kv: -len(kv[0])):
-                if raw:
-                    text = text.replace(raw, label)
+                if not raw:
+                    continue
+                text = re.sub(r"(?<![0-9A-Za-z_])" + re.escape(raw) + r"(?![0-9A-Za-z_])",
+                              label, text)
             return text
 
         last = self._history[0] if self._history else None
