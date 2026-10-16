@@ -199,7 +199,7 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.4.0"
+    plugin_version = "0.4.1"
     # 插件作者
     plugin_author = "nc17"
     # 作者主页
@@ -1187,15 +1187,12 @@ class TrackerLimit(_PluginBase):
             rows.append({
                 "component": "VRow",
                 "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
-                        {"component": "VText", "props": {"class": "text-subtitle-2",
-                                                         "text": f"下载器 {dl}（{len(sites)} 个站）"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VText", "props": {"text": f"下载器 {dl}（{len(sites)} 个站）"}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                        {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
-                                                         "text": "上传限速 KB/s"}}]},
+                        {"component": "VText", "props": {"text": "上传限速 KB/s"}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                        {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
-                                                         "text": "peer 上限"}}]},
+                        {"component": "VText", "props": {"text": "peer 上限"}}]},
                 ]
             })
             for name in sorted(sites, key=lambda one: (len(str(one)), str(one))):
@@ -1212,20 +1209,19 @@ class TrackerLimit(_PluginBase):
                     "component": "VRow",
                     "props": {"align": "center"},
                     "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
-                            {"component": "VText", "props": {"class": "text-body-2 font-weight-medium",
-                                                             "text": name}},
-                            {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
-                                                             "text": "、".join(info["keys"])[:60]}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VText", "props": {"text": name}}]},
                         {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
                             {"component": "VTextField",
-                             "props": {"model": f"up_{suffix}", "value": upload, "type": "number",
-                                       "placeholder": "0 = 不限速", "suffix": "KB/s",
+                             "props": {"model": f"up_{suffix}", "value": upload,
+                                       "label": "限速 KB/s", "type": "number",
+                                       "placeholder": "0=不限速",
                                        "density": "compact", "variant": "outlined", "hide-details": True}}]},
                         {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
                             {"component": "VTextField",
-                             "props": {"model": f"pw_{suffix}", "value": peer, "type": "number",
-                                       "placeholder": "0 = 不限制",
+                             "props": {"model": f"pw_{suffix}", "value": peer,
+                                       "label": "peer", "type": "number",
+                                       "placeholder": "0=不限制",
                                        "density": "compact", "variant": "outlined", "hide-details": True}}]},
                     ]
                 })
@@ -1250,9 +1246,8 @@ class TrackerLimit(_PluginBase):
                     ]}]},
                 {"component": "VCardText", "props": {"class": "py-0"}, "content": [
                     {"component": "VText", "props": {
-                        "class": "text-caption text-medium-emphasis",
-                        "text": "改完点「保存全部」即生效（下一轮巡检 / 点「立即巡检」时按新值改种）。"
-                                "限速 0 = 不限速，peer 0 = 不限制；想加新站去配置页的清单里把那一行的 # 去掉。"}}]},
+                        "text": "改完点「保存全部」即生效。限速 0 = 不限速，peer 0 = 不限制；"
+                                "想加新站去配置页的清单里把那一行的 # 去掉。"}}]},
                 {"component": "VCardText", "props": {"class": "pt-1"}, "content": rows or [
                     {"component": "VText", "props": {"class": "text-caption", "text": "（还没有规则）"}}]},
             ]
