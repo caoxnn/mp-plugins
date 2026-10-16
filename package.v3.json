@@ -19,13 +19,14 @@
     "name": "站点限速",
     "description": "按 tracker 给 Transmission 里的种子上传限速 + peer 上限：每 N 小时巡检一次，读当前值、只在与规则不一致时改一次（同一目标的种批量下发）。下载器用 MP 里已配好的，不需要另存 RPC 账号。",
     "labels": "工具",
-    "version": "0.1.2",
+    "version": "0.2.0",
     "icon": "Transmission_A.png",
     "author": "nc17",
     "level": 1,
     "release": true,
     "system_version": ">=3.0.0",
     "history": {
+      "v0.2.0": "规则表改成「站点名 + 上传限速 / peer 上限」可编辑：中文站名打头（01.馒头/18.麒麟…），两栏直接填数字，「保存全部」一次回写；删除改成小图标按钮。留空=不动、0=不限速/不限制",
       "v0.1.2": "匹配口径对齐 go_rpc：内置 86 条「域名→站群别名」表，先精确（别名）再子串兜底 —— 修掉馒头/麒麟/TTG/观众/彩虹岛等别名与域名不同的站会漏的问题（实测命中 3501 → 3983，会被改仍为 0）",
       "v0.1.1": "修两处实测坑：① transmission_rpc 的 get_torrents(arguments=) 收的是字段名列表，不是 {\"fields\": [...]}（写错就 KeyError: trackers）；② 属性读取统一兜底 + API 出错不再 500",
       "v0.1.0": "首版：把 go_rpc（Flask + 自带 Transmission RPC）搬成插件 —— 规则表挪到详情页（下载器 · tracker 关键字 · 上传限速 · peer 上限），巡检走 MP 的 DownloaderHelper 拿 Transmission 实例；peer 上限走底层 trc（MP 那层没有这个参数）"

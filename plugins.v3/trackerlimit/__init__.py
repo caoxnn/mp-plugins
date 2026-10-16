@@ -15,8 +15,11 @@ RPC 地址/账号；规则表挪到插件详情页上维护。
 import datetime
 import threading
 import traceback
+import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+from fastapi import Request
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -152,6 +155,41 @@ SITE_GROUPS: Dict[str, str] = {  # ← 从 go_rpc 的 site_groups 默认表原�
 }
 
 
+# 站点显示名：关键字片段 → 中文名（名称取自 go_rpc 的 site_names.json 与 venus 的站点模块名）
+SITE_LABELS: Dict[str, str] = {
+    "m-team": "01.馒头", "mteam": "01.馒头",
+    "hdsky": "02.天空",
+    "chdbits": "03.彩虹岛", "rainbowisland": "03.彩虹岛",
+    "totheglory": "04.听听歌", "ttg": "04.听听歌",
+    "ourbits": "05.我堡",
+    "springsunday": "06.春天",
+    "pterclub": "07.猫站", "pter": "07.猫站",
+    "hdhome": "08.家园",
+    "keepfrds": "09.月月",
+    "audiences": "10.观众", "cinefiles": "10.观众",
+    "hhanclub": "11.憨憨",
+    "hddolby": "13.杜比",
+    "ubits": "14.UB",
+    "piggo": "15.猪猪",
+    "agsvpt": "16.末日",
+    "qingwa": "17.青蛙",
+    "hdkyl": "18.麒麟",
+    "nicept": "老师",
+    "btschool": "学校",
+    "x-anime": "萝莉",
+    "cspt": "财神",
+    "zmpt": "织梦",
+    "pandapt": "熊猫",
+    "xingyunge": "星云",
+    "cangbao": "藏宝",
+    "crabpt": "蟹黄堡",
+    "hdarea": "HDarea",
+    "hdtime": "HDTime",
+    "luckpt": "LuckyPT",
+    "tangpt": "唐PT",
+    "march": "MARCH",
+}
+
 class TrackerLimit(_PluginBase):
     # 插件名称
     plugin_name = "站点限速"
@@ -160,7 +198,7 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.1.2"
+    plugin_version = "0.2.0"
     # 插件作者
     plugin_author = "nc17"
     # 作者主页
@@ -264,6 +302,20 @@ class TrackerLimit(_PluginBase):
                 if v.get("downloader") == downloader and v.get("enabled", True)]
         rows.sort(key=lambda x: len(str(x.get("tracker") or ""), ), reverse=True)
         return rows
+
+    @staticmethod
+    def __label(tracker: Any) -> str:
+        """规则关键字 → 给人看的站点名（认不出来就原样显示关键字）"""
+        key = str(tracker or "").lower()
+        for word in sorted(SITE_LABELS, key=len, reverse=True):
+            if word in key:
+                return SITE_LABELS[word]
+        return str(tracker or "")
+
+    @classmethod
+    def __suffix(cls, downloader: Any, tracker: Any) -> str:
+        """表单字段用的稳定后缀：只留字母数字，其它换 _（前端 model 名不能带点/斜杠）"""
+        return re.sub(r"[^0-9a-zA-Z]+", "_", f"{downloader}__{tracker}")
 
     @staticmethod
     def __hosts(announces: List[str]) -> List[str]:
@@ -533,6 +585,12 @@ class TrackerLimit(_PluginBase):
             "summary": "干跑一次",
             "description": "只列出会被改的种，不真改",
         }, {
+            "path": "/save_rules",
+            "endpoint": self.api_save_rules,
+            "methods": ["POST"],
+            "summary": "保存整张规则表",
+            "description": "页面「保存全部」：up_*/pw_* 字段一次性回写（留空=不动、0=不限速/不限制）",
+        }, {
             "path": "/save_rule",
             "endpoint": self.api_save_rule,
             "methods": ["POST"],
@@ -588,6 +646,59 @@ class TrackerLimit(_PluginBase):
                    f"会被改 {result.get('changed', 0)}（没实际改）")
         if result.get("errors"):
             message += f"；错误：{'；'.join(str(e) for e in result['errors'])[:200]}"
+        return schemas.Response(success=True, message=message)
+
+    async def api_save_rules(self, request: Request = None, apikey: str = None) -> schemas.Response:
+        """面板「保存全部」：整张规则表的限速 / peer 一次回写。
+
+        ⚠️ 插件 API 是宿主用 FastAPI 按函数签名注册的路由，**签名里没有的参数会被 422 挡掉**，
+        所以这里不收固定参数，改成自己从请求里捞：query（前端表单就发这里）+ JSON body + 表单。
+        字段名 = `up_<后缀>` / `pw_<后缀>`（后缀 = 下载器__关键字 里的非字母数字换成 _）。
+        约定：哪一栏留空 = 这一项不动；填 0 = 不限速 / 不限制。
+        """
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False, message="API密钥错误")
+        kwargs: Dict[str, Any] = {}
+        if request is not None:
+            try:
+                kwargs.update({k: v for k, v in request.query_params.items()})
+            except Exception:  # noqa: BLE001
+                pass
+            for reader in ("json", "form"):
+                try:
+                    got = await getattr(request, reader)()
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(got, dict):
+                    for k, v in got.items():
+                        if not isinstance(v, (dict, list)):
+                            kwargs[k] = v
+        changed: List[str] = []
+        bad: List[str] = []
+        for key, rule in list(self._rules.items()):
+            dl = str(rule.get("downloader") or "")
+            tracker = str(rule.get("tracker") or "")
+            suffix = self.__suffix(dl, tracker)
+            for name, field in (("upload_kbps", f"up_{suffix}"), ("peer_limit", f"pw_{suffix}")):
+                if field not in kwargs:
+                    continue
+                raw = kwargs.get(field)
+                if raw is None or str(raw).strip() == "":
+                    continue                     # 留空 = 不动
+                want = _as_int(raw)
+                if want is None or want < 0:
+                    bad.append(f"{self.__label(tracker)}（{tracker}）的 {name}")
+                    continue
+                now = _as_int(rule.get(name)) or 0
+                if want != now:
+                    rule[name] = want
+                    changed.append(f"{self.__label(tracker)}｜{dl}｜{name} {now} → {want}")
+        if changed:
+            self.__save_rules()
+            logger.info(f"站点限速：面板保存了 {len(changed)} 项 - {'；'.join(changed[:10])}")
+        message = f"已保存 {len(changed)} 项改动" if changed else "没有变化（数值和现在一样）"
+        if bad:
+            message += f"；填的不是数字，没保存：{'、'.join(bad[:5])}"
         return schemas.Response(success=True, message=message)
 
     def api_save_rule(self, apikey: str = None, rule_downloader: str = None,
@@ -765,71 +876,120 @@ class TrackerLimit(_PluginBase):
             ]
         }
 
-        # ---- 规则表
-        rule_rows = []
-        for key, rule in sorted(self._rules.items(),
-                                key=lambda kv: (kv[1].get("downloader") or "", kv[1].get("tracker") or "")):
-            upload = _as_int(rule.get("upload_kbps"))
-            peer = _as_int(rule.get("peer_limit"))
-            rule_rows.append({
+        # ---- 规则表：站点名 + 上传限速 + peer 上限（直接改，改完点「保存全部」）
+        groups: Dict[str, List[Tuple[str, dict]]] = {}
+        for key, rule in self._rules.items():
+            groups.setdefault(str(rule.get("downloader") or ""), []).append((key, rule))
+
+        rule_blocks: List[dict] = []
+        for dl in sorted(groups):
+            rule_blocks.append({
                 "component": "VRow",
                 "props": {"align": "center"},
                 "content": [
-                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
-                        {"component": "VChip", "props": {"color": "primary", "size": "small", "variant": "tonal"},
-                         "content": [{"component": "VText",
-                                      "props": {"text": str(rule.get("downloader") or "")}}]}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 4}, "content": [
-                        {"component": "VText", "props": {"text": str(rule.get("tracker") or "")}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
-                        {"component": "VText",
-                         "props": {"text": (f"上传 {upload} KB/s" if upload else "上传不限速")}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
-                        {"component": "VText",
-                         "props": {"text": (f"peer {peer}" if peer else "peer 不动")}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 1}, "content": [
-                        {"component": "VChip",
-                         "props": {"color": "success" if rule.get("enabled", True) else "default",
-                                   "size": "small", "variant": "tonal"},
-                         "content": [{"component": "VText",
-                                      "props": {"text": "启用" if rule.get("enabled", True) else "停用"}}]}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 1}, "content": [
-                        {"component": "VBtn",
-                         "props": {"size": "small", "color": "error", "variant": "tonal"},
-                         "text": "删除",
-                         "events": {"click": {
-                             "api": f"plugin/{self.__class__.__name__}/del_rule?apikey={settings.API_TOKEN}",
-                             "method": "post",
-                             "params": {"key": key}}}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
+                        {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
+                                                          "text": f"下载器 {dl}（{len(groups[dl])} 条）"}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
+                        {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
+                                                          "text": "上传限速 KB/s"}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
+                        {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
+                                                          "text": "peer 上限"}}]},
                 ]
             })
+            for key, rule in sorted(groups[dl],
+                                    key=lambda kv: (self.__label(kv[1].get("tracker")),
+                                                    str(kv[1].get("tracker") or ""))):
+                tracker = str(rule.get("tracker") or "")
+                upload = _as_int(rule.get("upload_kbps"))
+                peer = _as_int(rule.get("peer_limit"))
+                suffix = self.__suffix(dl, tracker)
+                # 当前值灌进插件数据 —— 前端表单拿它当默认值（model 字段名 = up_/pw_ + 后缀）
+                self.save_data(f"up_{suffix}", "" if upload is None else upload)
+                self.save_data(f"pw_{suffix}", "" if peer is None else peer)
+                rule_blocks.append({
+                    "component": "VRow",
+                    "props": {"align": "center"},
+                    "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
+                            {"component": "VText", "props": {"class": "text-body-2 font-weight-medium",
+                                                             "text": self.__label(tracker)}},
+                            {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
+                                                             "text": tracker}}]},
+                        {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
+                            {"component": "VTextField",
+                             "props": {"model": f"up_{suffix}", "value": "" if upload is None else upload,
+                                       "placeholder": "0 = 不限速", "type": "number", "suffix": "KB/s",
+                                       "density": "compact", "variant": "outlined", "hide-details": True}}]},
+                        {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
+                            {"component": "VTextField",
+                             "props": {"model": f"pw_{suffix}", "value": "" if peer is None else peer,
+                                       "placeholder": "0 = 不限制", "type": "number",
+                                       "density": "compact", "variant": "outlined", "hide-details": True}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 1}, "content": [
+                            {"component": "VBtn",
+                             "props": {"size": "x-small", "color": "error", "variant": "text",
+                                       "icon": "mdi-delete"},
+                             "events": {"click": {
+                                 "api": f"plugin/{self.__class__.__name__}/del_rule?apikey={settings.API_TOKEN}",
+                                 "method": "post", "params": {"key": key}}}}]},
+                    ]
+                })
+
+        rules_card = {
+            "component": "VCard",
+            "props": {"variant": "tonal", "class": "mb-4"},
+            "content": [
+                {"component": "VCardTitle", "content": [
+                    {"component": "VRow", "props": {"align": "center"}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
+                            {"component": "VText", "props": {"class": "text-subtitle-1",
+                                                             "text": "规则表（站点名 → 上传限速 / peer 上限）"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VBtn",
+                             "props": {"color": "primary", "variant": "flat", "block": True, "size": "small"},
+                             "text": "保存全部",
+                             "events": {"click": {
+                                 "api": f"plugin/{self.__class__.__name__}/save_rules?apikey={settings.API_TOKEN}",
+                                 "method": "post"}}}]},
+                    ]}]},
+                {"component": "VCardText", "props": {"class": "py-0"}, "content": [
+                    {"component": "VText", "props": {
+                        "class": "text-caption text-medium-emphasis",
+                        "text": "限速填 0 = 不限速，peer 填 0 = 不限制；哪一栏留空就表示这一项不动。改完全表一起生效，存完下一轮巡检会照新值改种。"}}]},
+                {"component": "VCardText", "props": {"class": "pt-1"}, "content": rule_blocks or [
+                    {"component": "VText",
+                     "props": {"class": "text-caption", "text": "（还没有规则）"}}]},
+            ]
+        }
 
         add_card = {
             "component": "VCard",
             "props": {"variant": "tonal", "class": "mb-4"},
             "content": [
                 {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
-                 "text": "添加 / 覆盖一条规则（下载器 + tracker 关键字）"},
+                 "text": "新增一条规则"},
                 {"component": "VCardText", "content": [
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VSelect",
-                             "props": {"model": "rule_downloader", "label": "下载器",
-                                       "items": names, "density": "compact", "variant": "outlined"}}]},
+                             "props": {"model": "rule_downloader", "label": "下载器", "items": names,
+                                       "density": "compact", "variant": "outlined"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                             {"component": "VTextField",
-                             "props": {"model": "rule_tracker", "label": "tracker 关键字",
-                                       "placeholder": "例如 tracker.xingyungept.org / mteam",
+                             "props": {"model": "rule_tracker", "label": "站点 / tracker 关键字",
+                                       "placeholder": "例如 hdsky、tracker.xxx.org",
                                        "density": "compact", "variant": "outlined"}}]},
                         {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
                             {"component": "VTextField",
                              "props": {"model": "rule_upload", "label": "上传限速 KB/s",
-                                       "placeholder": "留空=不限速",
+                                       "placeholder": "0=不限速", "type": "number",
                                        "density": "compact", "variant": "outlined"}}]},
                         {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
                             {"component": "VTextField",
                              "props": {"model": "rule_peer", "label": "peer 上限",
-                                       "placeholder": "留空=不动",
+                                       "placeholder": "0=不限制", "type": "number",
                                        "density": "compact", "variant": "outlined"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [
                             {"component": "VBtn",
@@ -840,13 +1000,10 @@ class TrackerLimit(_PluginBase):
                                  "method": "post"}}}]},
                     ]},
                 ]},
-                {"component": "VCardText", "props": {"class": "pt-0"}, "content": rule_rows or [
-                    {"component": "VText",
-                     "props": {"class": "text-caption", "text": "（还没有规则）"}}]},
             ]
         }
 
-        page: List[dict] = [status_card, add_card]
+        page: List[dict] = [status_card, rules_card, add_card]
 
         # ---- 最近一轮改了什么
         if last and last.get("rows"):
