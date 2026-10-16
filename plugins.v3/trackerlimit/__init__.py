@@ -223,7 +223,7 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.7.3"
+    plugin_version = "0.8.0"
     # 插件作者
     plugin_author = "nc17"
     # 作者主页
@@ -264,6 +264,7 @@ class TrackerLimit(_PluginBase):
             self._cron = config.get("cron") or "0 */6 * * *"
             self._downloaders = list(config.get("downloaders") or [])
             self._config = dict(config)
+            self.__migrate_rules()
             self.__apply_box_config(config)
             self.__prune_box_keys(config)
             self.__save_rules()
@@ -324,18 +325,54 @@ class TrackerLimit(_PluginBase):
 
     # ------------------------------------------------------------------ 规则
     @staticmethod
-    def rule_key(downloader: str, tracker: str) -> str:
-        return f"{(downloader or '').strip()}|{(tracker or '').strip().lower()}"
+    def rule_key(tracker: str, downloader: str = "") -> str:
+        """规则只按 tracker 存 —— 一套规则管全部下载器（用户 2026-10-16 定）。
+
+        downloader 参数留着只为兼容老调用，不参与 key。
+        """
+        return str(tracker or "").strip().lower()
 
     def __save_rules(self):
         self.save_data("rules", self._rules)
 
-    def __rules_of(self, downloader: str) -> List[dict]:
-        """某台下载器下启用的规则，按关键字长度倒序（长关键字更具体，优先命中）"""
-        rows = [dict(v, _key=k) for k, v in self._rules.items()
-                if v.get("downloader") == downloader and v.get("enabled", True)]
-        rows.sort(key=lambda x: len(str(x.get("tracker") or ""), ), reverse=True)
+    def __rules(self) -> List[dict]:
+        """启用的规则（不分下载器，两台通用），按关键字长度倒序（长关键字更具体，优先命中）"""
+        rows = [dict(v, _key=k) for k, v in self._rules.items() if v.get("enabled", True)]
+        rows.sort(key=lambda x: len(str(x.get("tracker") or "")), reverse=True)
         return rows
+
+    def __migrate_rules(self) -> None:
+        """老数据是「下载器|tracker」一台一条；合并成一套。
+
+        同一个站两台的数值不一样时保留**先配的那台**（按下载器顺序），并在日志里点出来。
+        """
+        if not any("|" in str(key) for key in self._rules):
+            return
+        order = {str(dl): idx for idx, dl in enumerate(self.__runnable_downloaders() or [])}
+        merged: Dict[str, dict] = {}
+        conflicts: List[str] = []
+        for key, rule in sorted(self._rules.items(),
+                                key=lambda kv: order.get(str((kv[1] or {}).get("downloader") or ""), 99)):
+            rule = dict(rule or {})
+            tracker = str(rule.get("tracker") or str(key).split("|")[-1]).strip().lower()
+            if not tracker:
+                continue
+            up = _as_int(rule.get("upload_kbps")) or 0
+            peer = _as_int(rule.get("peer_limit")) or 0
+            old = merged.get(tracker)
+            if old is None:
+                merged[tracker] = {"tracker": tracker, "enabled": bool(rule.get("enabled", True)),
+                                   "upload_kbps": up, "peer_limit": peer, "updated": rule.get("updated")}
+            elif (up, peer) != (old["upload_kbps"], old["peer_limit"]):
+                conflicts.append(f"{tracker} 保留 {old['upload_kbps']}/{old['peer_limit']}，"
+                                 f"舍掉 {rule.get('downloader') or '另一台'} 的 {up}/{peer}")
+        if not merged:
+            return
+        self._rules = merged
+        self.__save_rules()
+        logger.info(f"站点限速：规则合并成一套（{len(merged)} 个站）")
+        if conflicts:
+            logger.warn("站点限速：同一个站两台上限不一样，已保留先配的那台 - " + "；".join(conflicts[:10]))
 
     _mp_name_cache: Optional[Dict[str, str]] = None
     _mp_name_at: float = 0.0
@@ -480,10 +517,9 @@ class TrackerLimit(_PluginBase):
     def __box_keys(self) -> Dict[str, str]:
         """当前该有的框字段名：{字段名: 站名}（配置页那两个框）。"""
         out: Dict[str, str] = {}
-        for dl in self.__runnable_downloaders() or []:
-            for name in (self.__managed_sites(dl) or {}):
-                for field in ("up", "pw"):
-                    out[f"{field}_{self.__box_token(dl)}__{self.__box_token(name)}"] = name
+        for name in (self.__managed_sites() or {}):
+            for field in ("up", "pw"):
+                out[f"{field}_{self.__box_token(name)}"] = name
         return out
 
     def __prune_box_keys(self, config: Dict[str, Any]) -> None:
@@ -504,11 +540,10 @@ class TrackerLimit(_PluginBase):
         只在巡检完 / 保存后调用，**不在渲染页面时写**（渲染里写配置会让宿主重载插件、把这次渲染打断）。
         """
         mirror: Dict[str, Any] = {}
-        for dl in self.__runnable_downloaders() or []:
-            for name, info in (self.__managed_sites(dl) or {}).items():
-                token = self.__box_token(name)
-                mirror[f"up_{self.__box_token(dl)}__{token}"] = _as_int(info.get("upload")) or 0
-                mirror[f"pw_{self.__box_token(dl)}__{token}"] = _as_int(info.get("peer")) or 0
+        for name, info in (self.__managed_sites() or {}).items():
+            token = self.__box_token(name)
+            mirror[f"up_{token}"] = _as_int(info.get("upload")) or 0
+            mirror[f"pw_{token}"] = _as_int(info.get("peer")) or 0
         if not mirror:
             return
         for key, value in mirror.items():
@@ -527,8 +562,8 @@ class TrackerLimit(_PluginBase):
         except Exception as err:  # noqa: BLE001
             logger.debug(f"站点限速：回写输入框默认值失败 - {err}")
 
-    def __managed_sites(self, downloader: str) -> Dict[str, Dict[str, Any]]:
-        """这个下载器上要管的站：已有规则的 ∪ **实际出现在这台 TR 上的**。
+    def __managed_sites(self) -> Dict[str, Dict[str, Any]]:
+        """要管的站：已有规则的 ∪ **两台 TR 上实际出现的**（一套规则管全部下载器）。
 
         {站名: {keys:[tracker 关键字…], upload, peer}}
 
@@ -541,8 +576,6 @@ class TrackerLimit(_PluginBase):
         """
         out: Dict[str, Dict[str, Any]] = {}
         for _key, rule in self._rules.items():
-            if str(rule.get("downloader") or "") != downloader:
-                continue
             name = self.__label(rule.get("tracker"))
             slot = out.setdefault(name, {"keys": [], "upload": None, "peer": None})
             tracker = str(rule.get("tracker") or "")
@@ -550,7 +583,7 @@ class TrackerLimit(_PluginBase):
                 slot["keys"].append(tracker)
             slot["upload"] = _as_int(rule.get("upload_kbps")) or 0
             slot["peer"] = _as_int(rule.get("peer_limit")) or 0
-        for tracker in self.__scan_keys(downloader):
+        for tracker in self.__scan_keys():
             name = self.__label(tracker)
             slot = out.setdefault(name, {"keys": [], "upload": None, "peer": None})
             if tracker not in slot["keys"]:
@@ -602,17 +635,18 @@ class TrackerLimit(_PluginBase):
             hosts = list(entry["hosts"])
         return hosts
 
-    def __scan_keys(self, downloader: str) -> List[str]:
+    def __scan_keys(self) -> List[str]:
         """扫描到的域名 → 规则关键字：能映射到站群别名的就用别名（一个别名覆盖该站所有域名）。
 
         用户提醒「一个站可能有好几个 TRACKER」——用别名当关键字时，规则按【精确别名】匹配，
         `on.springsunday.net`、`springsunday.net` 一起命中，不用一个域名一条规则。
         """
         keys: List[str] = []
-        for host in self.__scan_hosts(downloader):
-            key = str(SITE_GROUPS.get(host) or host).strip().lower()
-            if key and key not in keys:
-                keys.append(key)
+        for downloader in self.__runnable_downloaders() or []:
+            for host in self.__scan_hosts(downloader):
+                key = str(SITE_GROUPS.get(host) or host).strip().lower()
+                if key and key not in keys:
+                    keys.append(key)
         return keys
 
     @staticmethod
@@ -720,7 +754,7 @@ class TrackerLimit(_PluginBase):
                 summary["errors"].append(msg)
                 continue
 
-            rules = self.__rules_of(name)
+            rules = self.__rules()
             if not rules:
                 entry["note"] = "这台没有启用的规则"
                 continue
@@ -964,41 +998,40 @@ class TrackerLimit(_PluginBase):
         }
 
     def __apply_box_config(self, config: Dict[str, Any]) -> None:
-        """配置页「站点清单」里那两个框 → 写进规则。
+        """配置页「站点清单」里那两个框 → 写进规则（**一套规则管全部下载器**）。
 
-        字段名 `up_<下载器>__<站名>` / `pw_<下载器>__<站名>`（非字母数字换成 _，站名用 MP 站点名）。
+        字段名 `up_<站名>` / `pw_<站名>`（非字母数字换成 _，站名用 MP 站点名）。
         留空 = 这一项不动；填 0 = 不限速 / 不限制。同名站（多个 tracker 域名）一起改。
         """
         now = datetime.datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
         changed: List[str] = []
         bad: List[str] = []
-        for dl in self.__runnable_downloaders() or []:
-            sites = self.__managed_sites(dl)
-            if not sites:
+        sites = self.__managed_sites() or {}
+        name_of = {self.__box_token(name): name for name in sites}
+        for key, raw in (config or {}).items():
+            if str(key).count("__"):
                 continue
-            name_of = {self.__box_token(name): name for name in sites}
-            for key, raw in (config or {}).items():
-                matched = re.fullmatch(r"(up|pw)_(.+?)__(.+)", str(key))
-                if not matched or self.__box_token(dl) != matched.group(2):
-                    continue
-                name = name_of.get(matched.group(3))
-                if not name or raw is None or str(raw).strip() == "":
-                    continue
-                key_name = "upload_kbps" if matched.group(1) == "up" else "peer_limit"
-                want = _as_int(raw)
-                if want is None or want < 0:
-                    bad.append(f"{name} 的{key_name}")
-                    continue
-                for tracker in sites[name]["keys"]:
-                    rule_key = self.rule_key(dl, tracker)
-                    rule = self._rules.get(rule_key) or {"downloader": dl, "tracker": tracker,
-                                                         "enabled": True}
-                    if (_as_int(rule.get(key_name)) or 0) != want:
-                        changed.append(f"{name}｜{dl}｜{key_name} "
-                                       f"{_as_int(rule.get(key_name)) or 0} → {want}")
-                    rule[key_name] = want
-                    rule["updated"] = now
-                    self._rules[rule_key] = rule
+            matched = re.fullmatch(r"(up|pw)_(.+)", str(key))
+            if not matched or raw is None or str(raw).strip() == "":
+                continue
+            name = name_of.get(matched.group(2))
+            if not name:
+                continue
+            key_name = "upload_kbps" if matched.group(1) == "up" else "peer_limit"
+            want = _as_int(raw)
+            if want is None or want < 0:
+                bad.append(f"{name} 的{key_name}")
+                continue
+            for tracker in sites[name]["keys"]:
+                rule_key = self.rule_key(tracker)
+                rule = self._rules.get(rule_key) or {"tracker": tracker, "enabled": True}
+                if (_as_int(rule.get(key_name)) or 0) != want:
+                    changed.append(f"{name}｜{key_name} "
+                                   f"{_as_int(rule.get(key_name)) or 0} → {want}")
+                rule[key_name] = want
+                rule["tracker"] = str(tracker).strip().lower()
+                rule["updated"] = now
+                self._rules[rule_key] = rule
         if changed:
             self.__save_rules()
             self.__mirror_box_values()
@@ -1109,23 +1142,21 @@ class TrackerLimit(_PluginBase):
     def __site_box_rows(self) -> Tuple[List[dict], Dict[str, Any]]:
         """配置页「站点清单」：一行一个站 —— 站名 + 上传限速 + peer 两个框。
 
-        顺序跟 MP 站点配置页一致（按 pri，见 __site_pri）；字段名
-        `up_<下载器>__<站名>` / `pw_<下载器>__<站名>`，直接走宿主自己的配置保存
+        一套规则管全部下载器，所以不按下载器分组；顺序跟 MP 站点配置页一致（按 pri，
+        见 __site_pri）；字段名 `up_<站名>` / `pw_<站名>`，直接走宿主自己的配置保存
         （`props.model` + 页面「保存」），插件在 init_plugin 里把它翻成规则。
         """
         rows: List[dict] = []
         model: Dict[str, Any] = {}
-        for idx, dl in enumerate(self.__runnable_downloaders() or [], start=1):
-            sites = self.__managed_sites(dl)
-            if not sites:
-                continue
+        sites = self.__managed_sites() or {}
+        if sites:
             rows.append({
                 "component": "VRow",
                 "props": {"dense": True},
                 "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                         {"component": "VText", "props": {
-                            "class": "text-subtitle-2", "text": f"下载器 {idx}（{len(sites)} 个站）"}}]},
+                            "class": "text-caption", "text": "站点"}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
                         {"component": "VText", "props": {
                             "class": "text-caption", "text": "上传限速 KB/s"}}]},
@@ -1133,11 +1164,12 @@ class TrackerLimit(_PluginBase):
                         {"component": "VText", "props": {"class": "text-caption", "text": "peer 上限"}}]},
                 ]
             })
+        if sites:
             for name in self.__sort_names(sites):
                 upload = _as_int(sites[name].get("upload")) or 0
                 peer = _as_int(sites[name].get("peer")) or 0
-                up_key = f"up_{self.__box_token(dl)}__{self.__box_token(name)}"
-                pw_key = f"pw_{self.__box_token(dl)}__{self.__box_token(name)}"
+                up_key = f"up_{self.__box_token(name)}"
+                pw_key = f"pw_{self.__box_token(name)}"
                 model[up_key] = upload
                 model[pw_key] = peer
                 rows.append({
@@ -1243,17 +1275,15 @@ class TrackerLimit(_PluginBase):
         详情页只做展示 —— 所以这里不放输入框。
         """
         rows: List[dict] = []
-        for idx, dl in enumerate(self.__runnable_downloaders() or [], start=1):
-            sites = self.__managed_sites(dl)
-            if not sites:
-                continue
+        sites = self.__managed_sites() or {}
+        if sites:
             rows.append({
                 "component": "VRow",
                 "props": {"dense": True},
                 "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                         {"component": "VText", "props": {
-                            "class": "text-subtitle-2", "text": f"下载器 {idx}（{len(sites)} 个站）"}}]},
+                            "class": "text-caption", "text": "站点"}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
                         {"component": "VText", "props": {
                             "class": "text-caption", "text": "上传限速 KB/s"}}]},
@@ -1261,6 +1291,7 @@ class TrackerLimit(_PluginBase):
                         {"component": "VText", "props": {"class": "text-caption", "text": "peer 上限"}}]},
                 ]
             })
+        if sites:
             for name in self.__sort_names(sites):
                 rows.append({
                     "component": "VRow",

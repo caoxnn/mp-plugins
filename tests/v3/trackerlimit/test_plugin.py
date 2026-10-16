@@ -24,9 +24,10 @@ def test_as_int():
 
 
 def test_rule_key():
-    """规则键：下载器 + 小写 tracker。"""
-    assert TrackerLimit.rule_key("TR", "MTeam") == "TR|mteam"
-    assert TrackerLimit.rule_key(" 220 ", " hdsky ") == "220|hdsky"
+    """规则键只按 tracker（一套规则管全部下载器）；老调用多传一个下载器也不影响。"""
+    assert TrackerLimit.rule_key("MTeam") == "mteam"
+    assert TrackerLimit.rule_key(" hdsky ") == "hdsky"
+    assert TrackerLimit.rule_key("mteam", "TR") == "mteam"
 
 
 def test_match_rule_by_alias():
