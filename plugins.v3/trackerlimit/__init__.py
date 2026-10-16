@@ -199,7 +199,7 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.2.1"
+    plugin_version = "0.3.0"
     # 插件作者
     plugin_author = "nc17"
     # 作者主页
@@ -221,11 +221,16 @@ class TrackerLimit(_PluginBase):
     _downloaders: List[str] = []
     # 规则表：{f"{下载器}|{tracker关键字}": {...}}，存 data/rules
     _rules: Dict[str, Any] = {}
+    # 两台 TR 上实际有哪些站：{下载器: {站名: {keys:[...], count, upload, peer}}}，存 data/sites
+    _sites: Dict[str, Any] = {}
+    # 最近一次的配置原文（新增/改规则后回写配置页时用它合并，免得把其它键冲掉）
+    _config: Dict[str, Any] = {}
     # 最近巡检记录
     _history: List[dict] = []
 
     def init_plugin(self, config: dict = None):
         self._rules = self.get_data("rules") or {}
+        self._sites = self.get_data("sites") or {}
         self._history = self.get_data("history") or []
 
         if config:
@@ -234,6 +239,20 @@ class TrackerLimit(_PluginBase):
             self._onlyonce = config.get("onlyonce")
             self._cron = config.get("cron") or "0 */6 * * *"
             self._downloaders = list(config.get("downloaders") or [])
+            self._config = dict(config)
+            # 规则表：配置页每个下载器一个多行框（rules_<下载器后缀>），保存配置时按它重建
+            for name, value in config.items():
+                if not str(name).startswith("rules_") or value is None:
+                    continue
+                suffix = str(name)[len("rules_"):]
+                target = next((dl for dl in self.downloader_names()
+                               if self.__san(dl) == suffix), None)
+                if target:
+                    changed, removed, bad = self.__apply_rule_text(target, str(value))
+                    logger.info(f"站点限速：配置页改规则 {target} - 新增/改 {changed} 条"
+                                f"，删 {removed} 条" + (f"，没认出来：{bad}" if bad else ""))
+            self.__save_rules()
+        self.__sync_config_lines()
 
         self.stop_service()
 
@@ -368,9 +387,177 @@ class TrackerLimit(_PluginBase):
         return str(tracker or "")
 
     @classmethod
-    def __suffix(cls, downloader: Any, tracker: Any) -> str:
-        """表单字段用的稳定后缀：只留字母数字，其它换 _（前端 model 名不能带点/斜杠）"""
-        return re.sub(r"[^0-9a-zA-Z]+", "_", f"{downloader}__{tracker}")
+    def __runnable_downloaders(cls) -> List[str]:
+        """配置页要展示的下载器：MP 里配的 Transmission（拿不到就退回已选的那几台）"""
+        try:
+            found = cls.downloader_names()
+            if found:
+                return found
+        except Exception:  # noqa: BLE001
+            pass
+        return list(cls._downloaders or [])
+
+    @staticmethod
+    def __san(value: Any) -> str:
+        """配置项用的后缀：只留字母数字"""
+        return re.sub(r"[^0-9a-zA-Z]+", "_", str(value or ""))
+
+    @classmethod
+    def __name_to_key(cls) -> Dict[str, str]:
+        """MP 里的站点名 → tracker 关键字（按站群表反推：馒头 → mteam）"""
+        out: Dict[str, str] = {}
+        for host, group in SITE_GROUPS.items():
+            for cand in (group, host):
+                label = cls.__label(cand)
+                if label and label != cand:
+                    out.setdefault(label.lower(), group)
+        return out
+
+    def __site_lines(self, downloader: str) -> str:
+        """配置页给这个下载器出的规则行：一行一个「站名」（TR 上实际有的站 ∪ 已有规则）。
+
+        数值优先用已有规则的；某个站还没规则，就用它现在 TR 里的实际限速当默认值，
+        这样用户只需要改想改的那几个数。
+        """
+        seen: Dict[str, dict] = {}
+        for name, info in (self._sites.get(downloader) or {}).items():
+            seen[name] = {"upload": info.get("upload"), "peer": info.get("peer")}
+        for _key, rule in self._rules.items():
+            if str(rule.get("downloader") or "") != downloader:
+                continue
+            name = self.__label(rule.get("tracker"))
+            seen.setdefault(name, {})
+            seen[name]["upload"] = _as_int(rule.get("upload_kbps")) or 0
+            seen[name]["peer"] = _as_int(rule.get("peer_limit")) or 0
+        managed = set()
+        for _key, rule in self._rules.items():
+            if str(rule.get("downloader") or "") == downloader:
+                managed.add(self.__label(rule.get("tracker")))
+        rows = []
+        for name in sorted(seen, key=lambda one: (len(str(one)), str(one))):
+            info = seen[name]
+            line = f"{name} {info.get('upload') or 0} {info.get('peer') or 0}"
+            rows.append(line if name in managed else f"# {line}")
+        return "\n".join(rows)
+
+    def __sync_config_lines(self):
+        """把「TR 上实际有的站（前面带 # 的还没管）+ 现有规则」写回配置页的多行框。
+
+        只在真的变了的时候写，避免和宿主的保存流程互相打架。
+        """
+        conf = {}
+        for dl in self.__runnable_downloaders() or []:
+            conf[f"rules_{self.__san(dl)}"] = self.__site_lines(dl)
+        if not conf:
+            return
+        now = {**(self._config or {})}
+        if all(str(now.get(k) or "") == v for k, v in conf.items()):
+            return
+        now.update(conf)
+        try:
+            self.update_config(now)
+            self._config = now
+            logger.debug("站点限速：配置页的站点清单已刷新")
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f"站点限速：回写配置页清单失败 - {err}")
+
+    def __keys_of_name(self, downloader: str, name: str) -> List[str]:
+        """站名 → 它在 tracker 上的关键字（TR 清单里的域名 ∪ 已有规则的关键字）"""
+        keys: List[str] = []
+        info = (self._sites.get(downloader) or {}).get(name) or {}
+        keys.extend([str(one) for one in (info.get("keys") or []) if one])
+        for _key, rule in self._rules.items():
+            if str(rule.get("downloader") or "") != downloader:
+                continue
+            if self.__label(rule.get("tracker")) == name:
+                keys.append(str(rule.get("tracker") or ""))
+        if not keys:
+            mapped = self.__name_to_key().get(name.lower())
+            if mapped:
+                keys.append(mapped)
+        out: List[str] = []
+        for one in keys:
+            if one and one not in out:
+                out.append(one)
+        return out
+
+    def __resolve_target(self, downloader: str, token: str) -> Optional[str]:
+        """一行里的 站点名 / 域名 / 关键字 → tracker 关键字"""
+        token = str(token or "").strip()
+        if not token:
+            return None
+        low = token.lower()
+        for _key, rule in self._rules.items():
+            if str(rule.get("downloader") or "") != downloader:
+                continue
+            tracker = str(rule.get("tracker") or "")
+            if low == tracker.lower() or token == self.__label(tracker):
+                return tracker or None
+        for _key, rule in self._rules.items():          # 别的下载器上的同名字
+            tracker = str(rule.get("tracker") or "")
+            if tracker and token == self.__label(tracker):
+                return tracker
+        mapped = self.__name_to_key().get(low)
+        if mapped:
+            return mapped
+        if low in SITE_GROUPS:
+            return SITE_GROUPS[low]
+        return token
+
+    def __apply_rule_text(self, downloader: str, text: str) -> Tuple[int, int, List[str]]:
+        """配置页多行文本 → 这个下载器的规则。
+
+        一行一个站：站点名 [上传限速KB/s] [peer上限]；同名站（多个 tracker 域名）一次全写。
+        没写的站 = 这次不管它（原来的规则会被删掉）。
+        """
+        wanted: Dict[str, Tuple[Optional[int], Optional[int]]] = {}   # 关键字 → (限速, peer)
+        bad: List[str] = []
+        for raw in str(text or "").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [one for one in re.split(r"[\s,，=]+", line) if one]
+            if not parts:
+                continue
+            head = parts[0]
+            inner = re.match(r"^(.+?)[（(]([^)）]+)[)）]$", head)
+            if inner:                      # 兼容「名字(关键字)」老写法
+                name, target = inner.group(1).strip(), inner.group(2).strip()
+            else:
+                name, target = head, head
+            nums: List[Optional[int]] = []
+            for piece in parts[1:3]:
+                nums.append(0 if piece in ("-", "*") else _as_int(piece))
+            while len(nums) < 2:
+                nums.append(None)
+            keys = self.__keys_of_name(downloader, name)
+            if not keys and target != name:
+                keys = [target]
+            if not keys:
+                keys = [target]           # 认不出来的就按关键字原样来
+            for one in keys:
+                wanted[one] = (nums[0], nums[1])
+            if not keys:
+                bad.append(line)
+        changed = removed = 0
+        now = datetime.datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
+        for tracker, (upload, peer) in wanted.items():
+            key = self.rule_key(downloader, tracker)
+            old = self._rules.get(key) or {}
+            if not old or old.get("upload_kbps") != upload or old.get("peer_limit") != peer:
+                changed += 1
+            self._rules[key] = {
+                "downloader": downloader, "tracker": tracker,
+                "upload_kbps": upload, "peer_limit": peer,
+                "enabled": True, "updated": now,
+            }
+        for key, rule in list(self._rules.items()):
+            if str(rule.get("downloader") or "") != downloader:
+                continue
+            if str(rule.get("tracker") or "") not in wanted:
+                self._rules.pop(key, None)
+                removed += 1
+        return changed, removed, bad
 
     @staticmethod
     def __hosts(announces: List[str]) -> List[str]:
@@ -499,11 +686,28 @@ class TrackerLimit(_PluginBase):
             # 目标 → 该目标的 hash 列表（同目标一批发下去）
             groups: Dict[Tuple[bool, int, Optional[int]], List[str]] = {}
             hash2name: Dict[str, str] = {}
+            inventory = self._sites.setdefault(name, {})
             for torrent in torrents:
                 hash_string = str(_attr(torrent, "hash_string", "") or "")
                 if not hash_string:
                     continue
-                rule = self.__match_rule(rules, self.__announces(torrent))
+                announces = self.__announces(torrent)
+                # 顺手记下这台下载器上实际有哪些站（配置页就照这个列出来给人填）
+                cur_limited = bool(_attr(torrent, "upload_limited", False))
+                cur_upload = int(_attr(torrent, "upload_limit", 0) or 0) if cur_limited else 0
+                cur_peer = _as_int(_attr(torrent, "peer_limit", None)) or 0
+                for host in self.__hosts(announces):
+                    key = SITE_GROUPS.get(host, host)
+                    label = self.__label(key)
+                    if not label or label == key:
+                        continue
+                    slot = inventory.setdefault(label, {"keys": [], "count": 0, "upload": 0, "peer": 0})
+                    if key not in slot["keys"]:
+                        slot["keys"].append(key)
+                    slot["count"] = slot.get("count", 0) + 1
+                    slot["upload"] = cur_upload
+                    slot["peer"] = cur_peer
+                rule = self.__match_rule(rules, announces)
                 if not rule:
                     continue
                 entry["matched"] = summary["matched"] = summary["matched"] + 1
@@ -588,6 +792,8 @@ class TrackerLimit(_PluginBase):
                 )
             except Exception as err:  # noqa: BLE001
                 logger.error(f"站点限速：发通知失败 - {err}")
+        self.save_data("sites", self._sites)
+        self.__sync_config_lines()
         return summary
 
     def apply_now(self):
@@ -639,25 +845,6 @@ class TrackerLimit(_PluginBase):
             "methods": ["GET", "POST"],
             "summary": "干跑一次",
             "description": "只列出会被改的种，不真改",
-        }, {
-        }, {
-            "path": "/save_rules",
-            "endpoint": self.api_save_rules,
-            "methods": ["POST"],
-            "summary": "保存整张规则表",
-            "description": "页面「保存全部」：up_*/pw_* 字段一次性回写（留空=不动、0=不限速/不限制）",
-        }, {
-            "path": "/save_rule",
-            "endpoint": self.api_save_rule,
-            "methods": ["POST"],
-            "summary": "保存一条规则",
-            "description": "下载器 + tracker 关键字 + 上传限速 + peer 上限",
-        }, {
-            "path": "/del_rule",
-            "endpoint": self.api_del_rule,
-            "methods": ["POST"],
-            "summary": "删除一条规则",
-            "description": "按 key 删除",
         }]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -704,94 +891,103 @@ class TrackerLimit(_PluginBase):
             message += f"；错误：{'；'.join(str(e) for e in result['errors'])[:200]}"
         return schemas.Response(success=True, message=message)
 
-    async def api_save_rules(self, request: Request = None, apikey: str = None) -> schemas.Response:
-        """面板「保存全部」：整张规则表的限速 / peer 一次回写。
-
-        ⚠️ 插件 API 是宿主用 FastAPI 按函数签名注册的路由，**签名里没有的参数会被 422 挡掉**，
-        所以这里不收固定参数，改成自己从请求里捞：query（前端表单就发这里）+ JSON body + 表单。
-        字段名 = `up_<后缀>` / `pw_<后缀>`（后缀 = 下载器__关键字 里的非字母数字换成 _）。
-        约定：哪一栏留空 = 这一项不动；填 0 = 不限速 / 不限制。
-        """
-        if apikey != settings.API_TOKEN:
-            return schemas.Response(success=False, message="API密钥错误")
-        kwargs: Dict[str, Any] = {}
-        if request is not None:
-            try:
-                kwargs.update({k: v for k, v in request.query_params.items()})
-            except Exception:  # noqa: BLE001
-                pass
-            for reader in ("json", "form"):
-                try:
-                    got = await getattr(request, reader)()
-                except Exception:  # noqa: BLE001
-                    continue
-                if isinstance(got, dict):
-                    for k, v in got.items():
-                        if not isinstance(v, (dict, list)):
-                            kwargs[k] = v
-        changed: List[str] = []
-        bad: List[str] = []
-        for key, rule in list(self._rules.items()):
-            dl = str(rule.get("downloader") or "")
-            tracker = str(rule.get("tracker") or "")
-            suffix = self.__suffix(dl, tracker)
-            for name, field in (("upload_kbps", f"up_{suffix}"), ("peer_limit", f"pw_{suffix}")):
-                if field not in kwargs:
-                    continue
-                raw = kwargs.get(field)
-                if raw is None or str(raw).strip() == "":
-                    continue                     # 留空 = 不动
-                want = _as_int(raw)
-                if want is None or want < 0:
-                    bad.append(f"{self.__label(tracker)}（{tracker}）的 {name}")
-                    continue
-                now = _as_int(rule.get(name)) or 0
-                if want != now:
-                    rule[name] = want
-                    changed.append(f"{self.__label(tracker)}｜{dl}｜{name} {now} → {want}")
-        if changed:
-            self.__save_rules()
-            logger.info(f"站点限速：面板保存了 {len(changed)} 项 - {'；'.join(changed[:10])}")
-        message = f"已保存 {len(changed)} 项改动" if changed else "没有变化（数值和现在一样）"
-        if bad:
-            message += f"；填的不是数字，没保存：{'、'.join(bad[:5])}"
-        return schemas.Response(success=True, message=message)
-
-    def api_save_rule(self, apikey: str = None, rule_downloader: str = None,
-                      rule_tracker: str = None, rule_upload: str = None,
-                      rule_peer: str = None, rule_enabled: bool = True) -> schemas.Response:
-        if apikey != settings.API_TOKEN:
-            return schemas.Response(success=False, message="API密钥错误")
-        downloader = str(rule_downloader or "").strip()
-        tracker = str(rule_tracker or "").strip()
-        if not downloader or not tracker:
-            return schemas.Response(success=False, message="下载器和 tracker 关键字都要填")
-        upload = _as_int(rule_upload)
-        peer = _as_int(rule_peer)
-        key = self.rule_key(downloader, tracker)
-        self._rules[key] = {
-            "downloader": downloader,
-            "tracker": tracker,
-            "upload_kbps": upload,
-            "peer_limit": peer,
-            "enabled": bool(rule_enabled),
-            "updated": datetime.datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S"),
+    def __state_card(self) -> dict:
+        """状态卡 + 立即巡检 / 干跑（配置页就是首页，按钮放这儿）"""
+        last = self._history[0] if self._history else None
+        bits = [
+            f"启用：{'是' if self._enabled else '否'}",
+            f"周期：{self._cron or '未设置'}",
+            f"管 {len(self._downloaders)} 台：{('、'.join(self._downloaders)) or '（未选）'}",
+            f"规则 {len([r for r in self._rules.values() if r.get('enabled', True)])} 条",
+        ]
+        if last:
+            bits.append(f"上次巡检：{last.get('time')} · 扫描 {last.get('scanned', 0)} · 改 {last.get('changed', 0)}"
+                        + (f" · 错误 {len(last.get('errors') or [])}" if last.get("errors") else ""))
+        def button(text: str, path: str, color: str, variant: str) -> dict:
+            return {"component": "VBtn",
+                    "props": {"color": color, "variant": variant, "size": "small", "block": True},
+                    "text": text,
+                    "events": {"click": {"api": f"plugin/{self.__class__.__name__}/{path}"
+                                                f"?apikey={settings.API_TOKEN}", "method": "post"}}}
+        return {
+            "component": "VCard",
+            "props": {"variant": "tonal", "class": "mb-4"},
+            "content": [
+                {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
+                 "text": "站点限速（Transmission）"},
+                {"component": "VCardText", "content": [
+                    {"component": "VRow", "props": {"align": "center"}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
+                            {"component": "VText", "props": {"class": "text-body-2",
+                                                             "text": " ｜ ".join(bits)}}]},
+                        {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
+                            button("立即巡检", "apply_now", "primary", "flat")]},
+                        {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
+                            button("干跑（不改）", "dry_run", "secondary", "tonal")]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VText", "props": {
+                                "class": "text-caption text-medium-emphasis",
+                                "text": "「立即巡检」= 按上面的规则改种的上传限速 / peer，只改对不上的；"
+                                        "「干跑」只报数不动手。定时巡检按上面的周期自动跑。"}}]},
+                    ]},
+                ]},
+            ]
         }
-        self.__save_rules()
-        logger.info(f"站点限速：保存规则 {key} → 上传 {upload or '不限'} / peer {peer if peer else '不动'}")
-        return schemas.Response(
-            success=True,
-            message=f"已保存：{downloader} · {tracker} → 上传 {upload or '不限速'} / peer {peer if peer else '不动'}",
-        )
 
-    def api_del_rule(self, apikey: str = None, key: str = None) -> schemas.Response:
-        if apikey != settings.API_TOKEN:
-            return schemas.Response(success=False, message="API密钥错误")
-        if key and key in self._rules:
-            self._rules.pop(key, None)
-            self.__save_rules()
-            return schemas.Response(success=True, message=f"已删除 {key}")
-        return schemas.Response(success=False, message="没找到这条规则")
+    def __history_card(self) -> dict:
+        """最近巡检记录 + 上一轮改了哪些种"""
+        last = self._history[0] if self._history else None
+        rows: List[dict] = []
+        if last and last.get("rows"):
+            rows.append({"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [
+                    {"component": "VText", "props": {
+                        "class": "text-subtitle-2",
+                        "text": f"上一轮改动（{last.get('time')}，共 {last.get('changed', 0)} 个种）"}}]}]})
+            for row in last["rows"][:30]:
+                rows.append({"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [
+                        {"component": "VText", "props": {"class": "text-caption",
+                                                         "text": str(row.get("downloader") or "")}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VText", "props": {"class": "text-caption",
+                                                         "text": str(row.get("name") or "")}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
+                        {"component": "VText", "props": {"class": "text-caption",
+                                                         "text": f"上传 {row.get('upload')}"}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
+                        {"component": "VText", "props": {"class": "text-caption",
+                                                         "text": f"peer {row.get('peer')}"}}]}]})
+        for item in self._history[:8]:
+            rows.append({"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                    {"component": "VText", "props": {"class": "text-caption",
+                                                     "text": str(item.get("time") or "")}}]},
+                {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [
+                    {"component": "VText", "props": {"class": "text-caption",
+                                                     "text": f"扫描 {item.get('scanned', 0)}"}}]},
+                {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [
+                    {"component": "VText", "props": {"class": "text-caption",
+                                                     "text": f"命中 {item.get('matched', 0)}"}}]},
+                {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [
+                    {"component": "VText", "props": {"class": "text-caption",
+                                                     "text": f"改 {item.get('changed', 0)}"}}]},
+                {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [
+                    {"component": "VText", "props": {
+                        "class": "text-caption text-medium-emphasis",
+                        "text": ("错误：" + "；".join(item.get("errors") or [])[:80]) if item.get("errors") else "OK"}}]}]})
+        return {
+            "component": "VCard",
+            "props": {"variant": "tonal"},
+            "content": [
+                {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
+                 "text": "巡检记录"},
+                {"component": "VCardText", "content": rows or [
+                    {"component": "VText", "props": {"class": "text-caption", "text": "还没跑过。"}}]},
+            ]
+        }
 
     # ------------------------------------------------------------------- 配置页
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -863,267 +1059,37 @@ class TrackerLimit(_PluginBase):
                                 "content": [
                                     {"component": "VAlert",
                                      "props": {"type": "info", "variant": "tonal", "density": "compact",
-                                               "text": "规则表在插件详情页上维护（下载器 · tracker 关键字 · 上传限速 · peer 上限）。"
-                                                       "只对 Transmission 生效，qB 实例会自动跳过。"}}
+                                               "text": "只对 Transmission 生效，qB 实例会自动跳过。"}},
+                                    *[{"component": "VTextarea",
+                                       "props": {"model": f"rules_{self.__san(dl)}",
+                                                 "label": f"规则 · 下载器 {dl}",
+                                                 "rows": min(24, max(6, len(self.__site_lines(dl).splitlines()) + 2)),
+                                                 "auto-grow": True, "variant": "outlined",
+                                                 "placeholder": "站点名 上传限速KB/s peer上限",
+                                                 "hint": "上面就是这两台 TR 上实际有的站（名字按 MP 的站点索引）。"
+                                                         "改数字就行：限速 0 = 不限速，peer 0 = 不限制；"
+                                                         "删掉哪一行 = 这个站不管了（它的规则会被删掉）。巡检时按这个表改种。"}}
+                                      for dl in self.__runnable_downloaders() or []]
                                 ]
                             }
                         ]
                     },
                 ]
             }
-        ], {
+            , self.__state_card(), self.__history_card()], {
             "enabled": False,
             "notify": False,
             "onlyonce": False,
             "cron": "0 */6 * * *",
             "downloaders": [],
+            **{f"rules_{self.__san(dl)}": (self.__site_lines(dl) or "")
+               for dl in self.__runnable_downloaders() or []},
         }
 
     # ------------------------------------------------------------------- 详情页
-    def get_page(self) -> List[dict]:
-        names = self.downloader_names()
-        last = self._history[0] if self._history else None
-
-        # ---- 状态卡
-        status_bits = [
-            f"启用：{'是' if self._enabled else '否'}",
-            f"周期：{self._cron or '未设置'}",
-            f"管 {len(self._downloaders)} 台：{('、'.join(self._downloaders)) or '（未选）'}",
-            f"规则 {len([r for r in self._rules.values() if r.get('enabled', True)])} 条",
-        ]
-        if last:
-            status_bits.append(
-                f"上次巡检：{last.get('time')} · 扫描 {last.get('scanned', 0)} · "
-                f"改 {last.get('changed', 0)}" + (f" · 错误 {len(last.get('errors') or [])}" if last.get("errors") else "")
-            )
-        status_card = {
-            "component": "VCard",
-            "props": {"variant": "tonal", "class": "mb-4"},
-            "content": [
-                {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
-                 "text": "站点限速（Transmission）"},
-                {"component": "VCardText", "content": [
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 10}, "content": [
-                            {"component": "VText", "props": {"class": "text-body-2",
-                                                             "text": " ｜ ".join(status_bits)}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [
-                            {"component": "VBtn",
-                             "props": {"color": "primary", "variant": "flat", "block": True, "size": "small"},
-                             "text": "立即巡检",
-                             "events": {"click": {
-                                 "api": f"plugin/{self.__class__.__name__}/apply_now?apikey={settings.API_TOKEN}",
-                                 "method": "post"}}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 10}, "content": [
-                            {"component": "VText", "props": {
-                                "class": "text-caption text-medium-emphasis",
-                                "text": "「立即巡检」= 读当前限速 → 只改与规则不一致的种（同一目标的种一次批量改）。"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [
-                            {"component": "VBtn",
-                             "props": {"color": "secondary", "variant": "tonal", "block": True, "size": "small"},
-                             "text": "干跑",
-                             "events": {"click": {
-                                 "api": f"plugin/{self.__class__.__name__}/dry_run?apikey={settings.API_TOKEN}",
-                                 "method": "post"}}}]},
-                    ]},
-                ]},
-            ]
-        }
-
-        # ---- 规则表：站点名 + 上传限速 + peer 上限（直接改，改完点「保存全部」）
-        groups: Dict[str, List[Tuple[str, dict]]] = {}
-        for key, rule in self._rules.items():
-            groups.setdefault(str(rule.get("downloader") or ""), []).append((key, rule))
-
-        rule_blocks: List[dict] = []
-        for dl in sorted(groups):
-            rule_blocks.append({
-                "component": "VRow",
-                "props": {"align": "center"},
-                "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
-                        {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
-                                                          "text": f"下载器 {dl}（{len(groups[dl])} 条）"}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                        {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
-                                                          "text": "上传限速 KB/s"}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                        {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
-                                                          "text": "peer 上限"}}]},
-                ]
-            })
-            for key, rule in sorted(groups[dl],
-                                    key=lambda kv: (self.__label(kv[1].get("tracker")),
-                                                    str(kv[1].get("tracker") or ""))):
-                tracker = str(rule.get("tracker") or "")
-                upload = _as_int(rule.get("upload_kbps"))
-                peer = _as_int(rule.get("peer_limit"))
-                suffix = self.__suffix(dl, tracker)
-                # 当前值灌进插件数据 —— 前端表单拿它当默认值（model 字段名 = up_/pw_ + 后缀）
-                self.save_data(f"up_{suffix}", "" if upload is None else upload)
-                self.save_data(f"pw_{suffix}", "" if peer is None else peer)
-                rule_blocks.append({
-                    "component": "VRow",
-                    "props": {"align": "center"},
-                    "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
-                            {"component": "VText", "props": {"class": "text-body-2 font-weight-medium",
-                                                             "text": self.__label(tracker)}},
-                            {"component": "VText", "props": {"class": "text-caption text-medium-emphasis",
-                                                             "text": tracker}}]},
-                        {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                            {"component": "VTextField",
-                             "props": {"model": f"up_{suffix}", "value": "" if upload is None else upload,
-                                       "placeholder": "0 = 不限速", "type": "number", "suffix": "KB/s",
-                                       "density": "compact", "variant": "outlined", "hide-details": True}}]},
-                        {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                            {"component": "VTextField",
-                             "props": {"model": f"pw_{suffix}", "value": "" if peer is None else peer,
-                                       "placeholder": "0 = 不限制", "type": "number",
-                                       "density": "compact", "variant": "outlined", "hide-details": True}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 1}, "content": [
-                            {"component": "VBtn",
-                             "props": {"size": "x-small", "color": "error", "variant": "text",
-                                       "icon": "mdi-delete"},
-                             "events": {"click": {
-                                 "api": f"plugin/{self.__class__.__name__}/del_rule?apikey={settings.API_TOKEN}",
-                                 "method": "post", "params": {"key": key}}}}]},
-                    ]
-                })
-
-        rules_card = {
-            "component": "VCard",
-            "props": {"variant": "tonal", "class": "mb-4"},
-            "content": [
-                {"component": "VCardTitle", "content": [
-                    {"component": "VRow", "props": {"align": "center"}, "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
-                            {"component": "VText", "props": {"class": "text-subtitle-1",
-                                                             "text": "规则表（站点名 → 上传限速 / peer 上限）"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VBtn",
-                             "props": {"color": "primary", "variant": "flat", "block": True, "size": "small"},
-                             "text": "保存全部",
-                             "events": {"click": {
-                                 "api": f"plugin/{self.__class__.__name__}/save_rules?apikey={settings.API_TOKEN}",
-                                 "method": "post"}}}]},
-                    ]}]},
-                {"component": "VCardText", "props": {"class": "py-0"}, "content": [
-                    {"component": "VText", "props": {
-                        "class": "text-caption text-medium-emphasis",
-                        "text": "限速填 0 = 不限速，peer 填 0 = 不限制；哪一栏留空就表示这一项不动。改完全表一起生效，存完下一轮巡检会照新值改种。"}}]},
-                {"component": "VCardText", "props": {"class": "pt-1"}, "content": rule_blocks or [
-                    {"component": "VText",
-                     "props": {"class": "text-caption", "text": "（还没有规则）"}}]},
-            ]
-        }
-
-        add_card = {
-            "component": "VCard",
-            "props": {"variant": "tonal", "class": "mb-4"},
-            "content": [
-                {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
-                 "text": "新增一条规则"},
-                {"component": "VCardText", "content": [
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                            {"component": "VSelect",
-                             "props": {"model": "rule_downloader", "label": "下载器", "items": names,
-                                       "density": "compact", "variant": "outlined"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                            {"component": "VTextField",
-                             "props": {"model": "rule_tracker", "label": "站点 / tracker 关键字",
-                                       "placeholder": "例如 hdsky、tracker.xxx.org",
-                                       "density": "compact", "variant": "outlined"}}]},
-                        {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
-                            {"component": "VTextField",
-                             "props": {"model": "rule_upload", "label": "上传限速 KB/s",
-                                       "placeholder": "0=不限速", "type": "number",
-                                       "density": "compact", "variant": "outlined"}}]},
-                        {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
-                            {"component": "VTextField",
-                             "props": {"model": "rule_peer", "label": "peer 上限",
-                                       "placeholder": "0=不限制", "type": "number",
-                                       "density": "compact", "variant": "outlined"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [
-                            {"component": "VBtn",
-                             "props": {"color": "primary", "variant": "flat", "block": True},
-                             "text": "保存规则",
-                             "events": {"click": {
-                                 "api": f"plugin/{self.__class__.__name__}/save_rule?apikey={settings.API_TOKEN}",
-                                 "method": "post"}}}]},
-                    ]},
-                ]},
-            ]
-        }
-
-        page: List[dict] = [status_card, rules_card, add_card]
-
-        # ---- 最近一轮改了什么
-        if last and last.get("rows"):
-            detail_rows = []
-            for row in last["rows"][:50]:
-                detail_rows.append({
-                    "component": "VRow",
-                    "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [
-                            {"component": "VText", "props": {"class": "text-caption",
-                                                             "text": str(row.get("downloader") or "")}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 7}, "content": [
-                            {"component": "VText", "props": {"class": "text-caption",
-                                                             "text": str(row.get("name") or "")}}]},
-                        {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
-                            {"component": "VText", "props": {"class": "text-caption",
-                                                             "text": f"上传 {row.get('upload')}"}}]},
-                        {"component": "VCol", "props": {"cols": 6, "md": 1}, "content": [
-                            {"component": "VText", "props": {"class": "text-caption",
-                                                             "text": f"peer {row.get('peer')}"}}]},
-                    ]
-                })
-            page.append({
-                "component": "VCard",
-                "props": {"variant": "tonal", "class": "mb-4"},
-                "content": [
-                    {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
-                     "text": f"上一轮改动（{last.get('time')}，共 {last.get('changed', 0)} 个种）"},
-                    {"component": "VCardText", "content": detail_rows},
-                ]
-            })
-
-        # ---- 历史
-        if self._history:
-            hist_rows = [{
-                "component": "VRow",
-                "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                        {"component": "VText", "props": {"class": "text-caption",
-                                                         "text": str(h.get("time") or "")}}]},
-                    {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [
-                        {"component": "VText", "props": {"class": "text-caption",
-                                                         "text": f"扫描 {h.get('scanned', 0)}"}}]},
-                    {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [
-                        {"component": "VText", "props": {"class": "text-caption",
-                                                         "text": f"命中 {h.get('matched', 0)}"}}]},
-                    {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [
-                        {"component": "VText", "props": {"class": "text-caption",
-                                                         "text": f"改 {h.get('changed', 0)}"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [
-                        {"component": "VText", "props": {
-                            "class": "text-caption text-medium-emphasis",
-                            "text": ("错误：" + "；".join(h.get("errors") or [])[:80]) if h.get("errors") else "OK"}}]},
-                ]
-            } for h in self._history[:10]]
-            page.append({
-                "component": "VCard",
-                "props": {"variant": "tonal"},
-                "content": [
-                    {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": "最近巡检记录"},
-                    {"component": "VCardText", "content": hist_rows},
-                ]
-            })
-        return page
+    def get_page(self) -> Optional[List[dict]]:
+        """不再单独做详情页：插件首页就是配置页（状态 + 规则 + 巡检记录都在那儿）"""
+        return None
 
     def stop_service(self):
         """退出插件"""
