@@ -199,7 +199,7 @@ class TrackerLimit(_PluginBase):
     # 插件图标
     plugin_icon = "Transmission_A.png"
     # 插件版本
-    plugin_version = "0.6.0"
+    plugin_version = "0.6.1"
     # 插件作者
     plugin_author = "nc17"
     # 作者主页
@@ -424,13 +424,17 @@ class TrackerLimit(_PluginBase):
 
     @classmethod
     def __runnable_downloaders(cls) -> List[str]:
-        """配置页要展示的下载器：MP 里配的 Transmission（拿不到就退回已选的那几台）"""
+        """要管的下载器 = MP 里配的、类型是 Transmission 的那几台（qB 自动跳过）。
+
+        顺序跟 MP 下载器配置一致；勾过下载器就只留勾过的。拿不到实例列表时退回勾选值。
+        """
         try:
-            found = cls.downloader_names()
-            if found:
-                return found
-        except Exception:  # noqa: BLE001
-            pass
+            trans = list(cls.__transmission_instances() or {})
+            if trans:
+                checked = [one for one in trans if one in (cls._downloaders or [])]
+                return checked or trans
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f"站点限速：读取下载器实例失败 - {err}")
         return list(cls._downloaders or [])
 
     @staticmethod
